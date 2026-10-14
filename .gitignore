@@ -41,3 +41,9 @@ example
 # generated native folders
 /ios
 /android
+
+# generated: MapLibre GL JS web worker (npm run map:worker)
+public/maplibre-gl-worker.mjs
+
+.freebuff
+AGENTS.md

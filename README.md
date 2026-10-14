@@ -25,6 +25,56 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Interactive map
+
+The Explore tab renders a real map with [MapLibre](https://maplibre.org): MapLibre Native
+(`@maplibre/maplibre-react-native`) on Android and iOS, and MapLibre GL JS on the web.
+MapLibre does not ship map data, so tiles come from a separate provider.
+
+- **Provider and tiles:** the [OpenFreeMap](https://openfreemap.org) public instance —
+  free, no API key, vector tiles built from OpenStreetMap data. The style URLs, the
+  Gaborone / Botswana camera defaults and the attribution all live in
+  `src/constants/map.ts`, so moving to another provider or to self-hosted tiles is a
+  change to that file.
+- **Attribution:** the map always shows `© OpenFreeMap · © OpenMapTiles · © OpenStreetMap`,
+  and tapping it reveals the full credit. OpenFreeMap and OpenStreetMap require this, and
+  the public instance forbids bulk and offline tile downloads.
+- **Controls:** the layers button cycles the provider styles (Positron, Liberty, Bright),
+  the map button toggles between Gaborone and the whole country, and the blue button
+  recentres on Gaborone — the slot that will track the device once GPS lands.
+
+### MapLibre needs a development build
+
+MapLibre ships native code that Expo Go does not bundle, so the map screen shows a
+"Map needs a development build" card there instead of a blank screen. Build and run a
+development client first:
+
+```bash
+npm run android          # local Android dev build (expo run:android)
+npm run ios              # local iOS dev build (expo run:ios)
+
+# or in the cloud, then install the build on the device
+npx eas-cli build --profile development --platform android
+npx eas-cli build --profile development --platform ios
+```
+
+After the dev client is installed, `npm start` serves the JavaScript to it.
+
+Tiles, styles and labels are downloaded at runtime, so the map needs a network
+connection; failures show a retry card on top of the map.
+
+### Web preview
+
+The web build uses MapLibre GL JS. `metro.config.js` copies MapLibre's web worker into
+`public/` (which Expo copies into the build) before every bundle, because Metro has no
+`import.meta.url` for MapLibre to resolve it from. Refresh the copy by hand with
+`npm run map:worker` after upgrading `maplibre-gl`.
+
+```bash
+npm run web:export       # static export to dist/
+node scripts/serve-dist.js 8090   # serve the export locally
+```
+
 ## Get a fresh project
 
 When you're ready, run:
