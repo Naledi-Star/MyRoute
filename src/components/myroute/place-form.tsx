@@ -1,4 +1,3 @@
-import { Image } from 'expo-image';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import {
@@ -12,15 +11,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { BottomNav } from './bottom-nav';
 import { Icon } from './icon';
-import { MapCanvas } from './map-canvas';
+import { InteractiveMap } from './interactive-map';
 import { AppText } from './text';
 import { PrimaryButton, Tap, TextField, TopBar } from './ui';
 
 import { Palette, Radius } from '@/constants/theme';
-import { featuredPlace, placeCategories, shopImage } from '@/data/myroute';
-
-const demoDescription =
-  'Behind the blue house near the big tree. From the main road, take the second dirt road on the left.';
+import { placeCategories } from '@/data/myroute';
+import { submitPlace } from '@/lib/api';
 
 /**
  * The wireframes use one form for both entry points: adding a place and asking
@@ -30,21 +27,68 @@ export function PlaceFormScreen({ request = false }: { request?: boolean }) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const [category, setCategory] = useState(placeCategories[0].label);
-  const [name, setName] = useState(request ? '' : featuredPlace.name);
-  const [description, setDescription] = useState(demoDescription);
-  const [pinDropped, setPinDropped] = useState(false);
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [pin, setPin] = useState<{ latitude: number; longitude: number } | null>(null);
   const [done, setDone] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [queued, setQueued] = useState(false);
 
   const leave = () => (router.canGoBack() ? router.back() : router.navigate('/'));
+
+  /**
+   * Send the place to the community database. A place is not the contributor's
+   * private bookmark: once approved it is what everybody else sees, so the form
+   * refuses to finish without a name and real coordinates.
+   */
+  const submit = async () => {
+    if (request) {
+      setDone(true);
+      return;
+    }
+    const placeName = name.trim();
+    if (!placeName) {
+      setSaveError('Give the place a name first.');
+      return;
+    }
+    if (!pin) {
+      setSaveError('Drop a pin on the map so the place has coordinates.');
+      return;
+    }
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const saved = await submitPlace({
+        name: placeName,
+        category,
+        description: description.trim(),
+        area: '',
+        latitude: pin.latitude,
+        longitude: pin.longitude,
+      });
+      // `local` means the backend is not configured or unreachable; the queue
+      // uploads it on the next launch rather than losing it.
+      setQueued(saved.status === 'local');
+      setDone(true);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not save this place.');
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const finish = () => {
     if (request) {
       router.navigate('/requests');
       return;
     }
+    const placeName = name.trim() || 'Unnamed place';
     router.navigate({
       pathname: '/place',
-      params: { name: name.trim() || featuredPlace.name },
+      params: pin
+        ? { name: placeName, lat: String(pin.latitude), lng: String(pin.longitude) }
+        : { name: placeName },
     });
   };
 
@@ -58,7 +102,9 @@ export function PlaceFormScreen({ request = false }: { request?: boolean }) {
         <AppText color="muted" style={styles.successText}>
           {request
             ? 'The community can now help you locate this place.'
-            : 'Thanks for making Botswana easier to explore.'}
+            : queued
+              ? 'Saved on this device. It will be sent to the community database as soon as you are online.'
+              : 'Sent to the community database for review. Once approved it appears on everyone’s map.'}
         </AppText>
         <PrimaryButton label="Done" onPress={finish} style={styles.successButton} />
       </View>
@@ -127,24 +173,16 @@ export function PlaceFormScreen({ request = false }: { request?: boolean }) {
             Where is it?
           </AppText>
           <AppText color="muted" size={9} style={styles.fieldHint}>
-            {pinDropped ? 'Pin dropped. Drag to fine tune.' : 'Drop a pin near the area.'}
+            {pin ? 'Pin dropped. Tap again to adjust.' : 'Tap the map to drop a pin.'}
           </AppText>
           <View style={styles.miniMap}>
-            <MapCanvas zoom={0.65} />
-            {pinDropped ? (
-              <View style={styles.droppedPin}>
-                <Icon color={Palette.red} name="pin" size={30} strokeWidth={2.1} />
-              </View>
-            ) : null}
-            <Tap
-              accessibilityLabel="Drop pin on map"
-              onPress={() => setPinDropped(true)}
-              style={styles.dropPin}>
-              <Icon color={Palette.green} name="pin" size={17} />
-              <AppText color="green" size={11} weight="bold">
-                {pinDropped ? 'Pin dropped' : 'Drop pin on map'}
-              </AppText>
-            </Tap>
+            <InteractiveMap
+              bottomInset={0}
+              droppedPin={pin}
+              focus="gaborone"
+              onMapPress={setPin}
+              styleId="positron"
+            />
           </View>
 
           <AppText size={11} style={styles.fieldLabel} weight="bold">
@@ -161,7 +199,6 @@ export function PlaceFormScreen({ request = false }: { request?: boolean }) {
             Add photos <AppText color="muted" size={11}> (optional)</AppText>
           </AppText>
           <View style={styles.photoRow}>
-            <Image contentFit="cover" source={shopImage} style={styles.photo} />
             <View style={styles.addPhoto}>
               <Icon name="camera" />
               <AppText size={9}>Add photo</AppText>
@@ -169,10 +206,16 @@ export function PlaceFormScreen({ request = false }: { request?: boolean }) {
           </View>
 
           <PrimaryButton
-            label={request ? 'Submit request' : 'Add this place'}
-            onPress={() => setDone(true)}
+            label={saving ? 'Sending…' : request ? 'Submit request' : 'Add this place'}
+            onPress={() => void submit()}
             style={styles.submit}
           />
+
+          {saveError ? (
+            <AppText color="red" size={11} style={styles.submitError}>
+              {saveError}
+            </AppText>
+          ) : null}
         </ScrollView>
       </KeyboardAvoidingView>
 
@@ -269,6 +312,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#F8FAF8',
   },
   submit: { marginTop: 24 },
+  submitError: { marginTop: 9, lineHeight: 15 },
   success: {
     flex: 1,
     padding: 35,

@@ -1,32 +1,28 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/myroute/icon';
-import { RequestCard } from '@/components/myroute/rows';
 import { AppText } from '@/components/myroute/text';
-import { PrimaryButton, RoundButton, SectionHeading, Segmented, TextField } from '@/components/myroute/ui';
+import {
+  PrimaryButton,
+  RoundButton,
+  SectionHeading,
+  Segmented,
+  SoftButton,
+  TextField,
+} from '@/components/myroute/ui';
 import { Palette, Radius } from '@/constants/theme';
-import { communityRequests, requestFilters } from '@/data/myroute';
+import { requestFilters } from '@/data/myroute';
+import { COMMUNITY_THREAD_ID, COMMUNITY_THREAD_TITLE } from '@/lib/chat';
 
 export default function RequestsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const [filter, setFilter] = useState(requestFilters[0]);
   const [search, setSearch] = useState('');
-
-  const visibleRequests = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    return communityRequests.filter((request) => {
-      const matchesFilter =
-        filter === 'My requests' ? request.mine : filter === 'I can help' ? request.canHelp : true;
-      const matchesSearch =
-        needle.length === 0 || `${request.name} ${request.detail}`.toLowerCase().includes(needle);
-      return matchesFilter && matchesSearch;
-    });
-  }, [filter, search]);
 
   return (
     <View style={styles.screen}>
@@ -48,7 +44,12 @@ export default function RequestsScreen() {
           titleVariant="sectionTitle"
         />
 
-        <Segmented onChange={setFilter} options={requestFilters} style={styles.segmented} value={filter} />
+        <Segmented
+          onChange={setFilter}
+          options={requestFilters}
+          style={styles.segmented}
+          value={filter}
+        />
 
         <View style={styles.searchPill}>
           <Icon color={Palette.muted} name="search" size={18} />
@@ -72,13 +73,9 @@ export default function RequestsScreen() {
         </View>
 
         <View style={styles.list}>
-          {visibleRequests.length > 0 ? (
-            visibleRequests.map((request) => <RequestCard key={request.name} request={request} />)
-          ) : (
-            <AppText color="muted" variant="small">
-              No requests match your search yet.
-            </AppText>
-          )}
+          <AppText color="muted" variant="small">
+            No community requests yet. Post one and neighbours can help you find it.
+          </AppText>
         </View>
 
         <View style={styles.cta}>
@@ -103,6 +100,15 @@ export default function RequestsScreen() {
             label="Create request"
             onPress={() => router.push('/create-request')}
             style={styles.ctaButton}
+          />
+          <SoftButton
+            label="Message neighbours"
+            onPress={() =>
+              router.push({
+                pathname: '/thread',
+                params: { id: COMMUNITY_THREAD_ID, title: COMMUNITY_THREAD_TITLE },
+              })
+            }
           />
         </View>
       </ScrollView>

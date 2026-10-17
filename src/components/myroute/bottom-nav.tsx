@@ -8,7 +8,7 @@ import { Tap } from './ui';
 
 import { Palette, Shadows } from '@/constants/theme';
 
-export type TabKey = 'explore' | 'saved' | 'add' | 'requests' | 'profile';
+export type TabKey = 'explore' | 'combi' | 'add' | 'requests' | 'profile';
 
 /**
  * The bar is also shown on screens that are pushed above the tabs, so it takes
@@ -32,7 +32,7 @@ export const BOTTOM_NAV_HEIGHT = 72;
 
 const tabs: { key: TabKey; label: string; icon: IconName }[] = [
   { key: 'explore', label: 'Explore', icon: 'compass' },
-  { key: 'saved', label: 'Saved', icon: 'bookmark' },
+  { key: 'combi', label: 'Combi', icon: 'minibus' },
   { key: 'add', label: 'Add', icon: 'plus' },
   { key: 'requests', label: 'Requests', icon: 'request' },
   { key: 'profile', label: 'Profile', icon: 'user' },
@@ -40,7 +40,7 @@ const tabs: { key: TabKey; label: string; icon: IconName }[] = [
 
 const destinations: Record<Exclude<TabKey, 'add'>, Href> = {
   explore: '/',
-  saved: '/saved',
+  combi: '/combi',
   requests: '/requests',
   profile: '/profile',
 };

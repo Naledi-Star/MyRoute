@@ -1,0 +1,29 @@
+name = "myroute-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# D1 database. Create it, then paste the id here and run the schema migration.
+#   npx wrangler d1 create myroute
+#   npx wrangler d1 execute myroute --file=./schema.sql --remote
+[[d1_databases]]
+binding = "DB"
+database_name = "myroute"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# R2 bucket for place/path photos.
+#   npx wrangler r2 bucket create myroute-photos
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "myroute-photos"
+
+[vars]
+# Comma-separated origins allowed to call the API (the Expo dev client / web).
+ALLOWED_ORIGINS = "*"
+# Clerk instance JWKS, e.g. https://<your-app>.clerk.accounts.dev/.well-known/jwks.json
+# Leave empty to allow anonymous contributions.
+CLERK_JWKS_URL = ""
+
+# Secrets (never commit these):
+#   npx wrangler secret put ADMIN_TOKEN
+#   npx wrangler secret put CLERK_JWKS_URL

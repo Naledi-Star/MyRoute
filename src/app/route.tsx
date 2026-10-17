@@ -1,10 +1,11 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/myroute/icon';
-import { MapCanvas } from '@/components/myroute/map-canvas';
+import { InteractiveMap } from '@/components/myroute/interactive-map';
+import type { MapMarker, MapRoute } from '@/components/myroute/map-types';
 import { AppText } from '@/components/myroute/text';
 import {
   BareIconButton,
@@ -15,19 +16,142 @@ import {
   TopBar,
 } from '@/components/myroute/ui';
 import { Palette, Radius, Shadows } from '@/constants/theme';
-import { findPlace, travelModes, type TravelModeKey } from '@/data/myroute';
+import { placeFromParams, travelModes, type TravelModeKey } from '@/data/myroute';
+import { useDeviceLocation } from '@/lib/location';
+import { formatDuration, getRoute, type TravelProfile } from '@/lib/routing';
+
+const PROFILE_FOR_MODE: Record<TravelModeKey, TravelProfile> = {
+  car: 'car',
+  bike: 'bike',
+  walk: 'foot',
+};
 
 export default function RouteScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const params = useLocalSearchParams<{ name?: string }>();
-  const destination = findPlace(params.name);
+  const params = useLocalSearchParams<{
+    name?: string;
+    lat?: string;
+    lng?: string;
+    area?: string;
+  }>();
+  const destination = placeFromParams({
+    name: params.name,
+    latitude: params.lat != null ? parseFloat(params.lat) : undefined,
+    longitude: params.lng != null ? parseFloat(params.lng) : undefined,
+    area: params.area,
+  });
   const [mode, setMode] = useState<TravelModeKey>('car');
   const active = travelModes.find((travel) => travel.key === mode) ?? travelModes[0];
 
+  const [route, setRoute] = useState<MapRoute | null>(null);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  const [summary, setSummary] = useState<string>(active.summary);
+  const [detail, setDetail] = useState<string>(active.detail);
+
+  // Origin: the device position, falling back to the Gaborone reference view.
+  const { origin: deviceOrigin, coords } = useDeviceLocation({ auto: true });
+  const [focusedOnMe, setFocusedOnMe] = useState(false);
+  const [recenterKey, setRecenterKey] = useState(0);
+  const origin = useMemo(
+    () => ({ latitude: deviceOrigin.latitude, longitude: deviceOrigin.longitude }),
+    [deviceOrigin.latitude, deviceOrigin.longitude],
+  );
+
+  // The destination pin. Community pins arrive with the backend later.
+  const markers: MapMarker[] = useMemo(() => {
+    if (!destination) {
+      return [];
+    }
+    return [
+      {
+        id: `destination-${destination.name}`,
+        latitude: destination.latitude,
+        longitude: destination.longitude,
+        label: destination.name,
+        tone: 'red' as const,
+        kind: 'destination' as const,
+      },
+    ];
+  }, [destination]);
+
+  // Fetch a real route whenever the destination or travel mode changes.
+  useEffect(() => {
+    if (!destination) {
+      return;
+    }
+    let cancelled = false;
+
+    getRoute(
+      [origin.longitude, origin.latitude],
+      [destination.longitude, destination.latitude],
+      PROFILE_FOR_MODE[mode],
+    )
+      .then((result) => {
+        if (cancelled) {
+          return;
+        }
+        setRoute({
+          coordinates: result.coordinates,
+          color: mode === 'walk' ? Palette.green : Palette.blue,
+        });
+        setSummary(formatDuration(result.durationSeconds));
+        const km = (result.distanceMetres / 1000).toFixed(1);
+        setDetail(`${km} km · ${active.note}`);
+        setRouteError(null);
+      })
+      .catch((error: Error) => {
+        if (cancelled) {
+          return;
+        }
+        setRoute(null);
+        setRouteError(error.message);
+        setSummary(active.summary);
+        setDetail(active.detail);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [destination, mode, origin.latitude, origin.longitude, active.detail, active.note, active.summary]);
+
+  if (!destination) {
+    return (
+      <View style={styles.screen}>
+        <TopBar
+          onBack={() => (router.canGoBack() ? router.back() : router.navigate('/'))}
+          style={{ paddingTop: insets.top }}
+          title="Directions"
+        />
+        <View style={styles.notFound}>
+          <Icon color={Palette.green} name="map" size={38} />
+          <AppText size={15} weight="bold">
+            Pick a destination first
+          </AppText>
+          <AppText color="muted" size={12} style={styles.notFoundText}>
+            Search for a place, then open directions to it.
+          </AppText>
+          <PrimaryButton
+            label="Search for a place"
+            onPress={() => router.replace('/search')}
+            style={styles.notFoundButton}
+          />
+        </View>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.screen}>
-      <MapCanvas route />
+      <InteractiveMap
+        bottomInset={205}
+        focus={focusedOnMe ? 'me' : 'gaborone'}
+        markers={markers}
+        recenterKey={recenterKey}
+        route={route ?? undefined}
+        styleId="positron"
+        userLocation={coords}
+      />
 
       <View style={styles.panel}>
         <TopBar
@@ -69,7 +193,7 @@ export default function RouteScreen() {
                   size={11}
                   style={{ color: isActive ? Palette.blue : '#5E6861' }}
                   weight={isActive ? 'bold' : 'regular'}>
-                  {travel.label}
+                  {isActive ? summary : travel.label}
                 </AppText>
               </Tap>
             );
@@ -79,7 +203,7 @@ export default function RouteScreen() {
 
       <View style={styles.routeTime}>
         <AppText color="white" size={11} weight="bold">
-          {active.summary}
+          {summary}
         </AppText>
       </View>
 
@@ -87,6 +211,10 @@ export default function RouteScreen() {
         accessibilityLabel="Locate me"
         icon="locate"
         iconColor={Palette.blue}
+        onPress={() => {
+          setFocusedOnMe(true);
+          setRecenterKey((value) => value + 1);
+        }}
         style={[styles.routeLocate, { bottom: insets.bottom + 205 }]}
       />
 
@@ -95,10 +223,10 @@ export default function RouteScreen() {
         <View style={styles.routeSummary}>
           <View style={styles.summaryCopy}>
             <AppText size={20} weight="bold">
-              {active.summary}
+              {summary}
             </AppText>
             <AppText color="muted" variant="small">
-              {active.detail}
+              {routeError ? `Using offline estimate · ${routeError}` : detail}
             </AppText>
           </View>
           <View style={styles.trafficNote}>
@@ -109,7 +237,17 @@ export default function RouteScreen() {
         </View>
         <PrimaryButton
           label="Start navigation"
-          onPress={() => router.push('/navigate')}
+          onPress={() =>
+            router.push({
+              pathname: '/navigate',
+              params: {
+                name: destination.name,
+                lat: String(destination.latitude),
+                lng: String(destination.longitude),
+                area: destination.area,
+              },
+            })
+          }
           style={styles.startButton}
         />
       </View>
@@ -214,4 +352,14 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.greenSoft,
   },
   startButton: { width: '100%' },
+  notFound: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 30,
+    gap: 8,
+    backgroundColor: Palette.surface,
+  },
+  notFoundText: { textAlign: 'center' },
+  notFoundButton: { marginTop: 10 },
 });

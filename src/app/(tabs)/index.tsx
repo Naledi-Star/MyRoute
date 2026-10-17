@@ -1,43 +1,32 @@
-import { useRouter } from 'expo-router';
-import { useState } from 'react';
-import { ScrollView, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Image } from 'expo-image';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { StyleSheet, View, type LayoutChangeEvent } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { Icon, type IconName } from '@/components/myroute/icon';
+import { Icon } from '@/components/myroute/icon';
 import { InteractiveMap } from '@/components/myroute/interactive-map';
-import type { MapFocus } from '@/components/myroute/map-types';
-import { CategoryTile, FeaturedPlaceCard } from '@/components/myroute/rows';
+import type { MapFocus, MapMarker } from '@/components/myroute/map-types';
 import { AppText } from '@/components/myroute/text';
-import { RoundButton, SectionHeading, SheetHandle, Tap, TextButton } from '@/components/myroute/ui';
-import { DEFAULT_MAP_STYLE, MAP_STYLE_ORDER, MAP_STYLES, type MapStyleId } from '@/constants/map';
-import { Palette, Radius, Shadows, type Tone } from '@/constants/theme';
-import { exploreCategories, featuredPlace, shopImage } from '@/data/myroute';
+import {
+  RoundButton,
+  SectionHeading,
+  SheetHandle,
+  Tap,
+  TextButton,
+} from '@/components/myroute/ui';
+import {
+  DEFAULT_MAP_STYLE,
+  MAP_STYLE_ORDER,
+  MAP_STYLES,
+  type MapStyleId,
+} from '@/constants/map';
+import { Palette, Radius, Shadows } from '@/constants/theme';
+import { fetchCommunityPlaces, type CommunityPlace } from '@/lib/api';
+import { useDeviceLocation } from '@/lib/location';
 
-const categoryTones: Tone[] = ['green', 'peach', 'amber', 'blue'];
-
-function QuickPill({
-  icon,
-  label,
-  tone,
-  onPress,
-}: {
-  icon: IconName;
-  label: string;
-  tone?: 'green' | 'amber';
-  onPress?: () => void;
-}) {
-  const colors = tone === 'amber' ? { fg: '#B26B13', bg: '#FFF0D9' } : { fg: Palette.green, bg: Palette.greenSoft };
-  return (
-    <Tap accessibilityLabel={label} onPress={onPress} style={styles.quickPill}>
-      <View style={[styles.quickDot, { backgroundColor: colors.bg }]}>
-        <Icon color={colors.fg} name={icon} size={16} />
-      </View>
-      <AppText size={12} weight="semibold">
-        {label}
-      </AppText>
-    </Tap>
-  );
-}
+const STYLE_STORAGE_KEY = 'myroute:mapStyle';
 
 export default function ExploreScreen() {
   const insets = useSafeAreaInsets();
@@ -45,32 +34,123 @@ export default function ExploreScreen() {
   const [sheetHeight, setSheetHeight] = useState(281);
   const [mapStyleId, setMapStyleId] = useState<MapStyleId>(DEFAULT_MAP_STYLE);
   const [mapFocus, setMapFocus] = useState<MapFocus>('gaborone');
+  const [recenterKey, setRecenterKey] = useState(0);
+  const autoLocated = useRef(false);
+
+  // The map follows the device: the first GPS fix takes the camera from the
+  // reference city view to wherever the user actually is.
+  const { coords, permission, error, start } = useDeviceLocation({ auto: true });
+  useEffect(() => {
+    if (coords && !autoLocated.current && mapFocus === 'gaborone') {
+      autoLocated.current = true;
+      setMapFocus('me');
+    }
+  }, [coords, mapFocus]);
+
+  const recentre = useCallback(() => {
+    setMapFocus('me');
+    setRecenterKey((value) => value + 1);
+    if (!coords) {
+      // Nothing to centre on yet — ask for (or retry) the location it needs.
+      void start();
+    }
+  }, [coords, start]);
+
+  // Remember the user's chosen style across sessions.
+  useEffect(() => {
+    AsyncStorage.getItem(STYLE_STORAGE_KEY)
+      .then((value) => {
+        if (value && MAP_STYLE_ORDER.includes(value as MapStyleId)) {
+          setMapStyleId(value as MapStyleId);
+        }
+      })
+      .catch(() => {
+        // Storage is best-effort.
+      });
+  }, []);
 
   const measureSheet = (event: LayoutChangeEvent) => {
     setSheetHeight(event.nativeEvent.layout.height);
   };
 
-  const cycleMapStyle = () => {
-    const next = (MAP_STYLE_ORDER.indexOf(mapStyleId) + 1) % MAP_STYLE_ORDER.length;
-    setMapStyleId(MAP_STYLE_ORDER[next]);
-  };
+  const cycleMapStyle = useCallback(() => {
+    const index = MAP_STYLE_ORDER.indexOf(mapStyleId);
+    const next = MAP_STYLE_ORDER[(index + 1) % MAP_STYLE_ORDER.length];
+    setMapStyleId(next);
+    AsyncStorage.setItem(STYLE_STORAGE_KEY, next).catch(() => {});
+  }, [mapStyleId]);
 
   const showCountry = mapFocus === 'botswana';
 
+  // Pins come from approved community places — the same database every device
+  // writes to, so a place added here (or anywhere) shows up for everybody.
+  const [communityPlaces, setCommunityPlaces] = useState<CommunityPlace[]>([]);
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      void fetchCommunityPlaces().then((places) => {
+        if (!cancelled) {
+          setCommunityPlaces(places);
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, []),
+  );
+
+  const markers = useMemo<MapMarker[]>(
+    () =>
+      communityPlaces.map((place) => ({
+        id: `place-${place.id}`,
+        latitude: place.latitude,
+        longitude: place.longitude,
+        label: place.name,
+        tone: 'green' as const,
+        kind: 'place' as const,
+      })),
+    [communityPlaces],
+  );
+
   return (
     <View style={styles.screen}>
-      <InteractiveMap bottomInset={sheetHeight} focus={mapFocus} styleId={mapStyleId} />
+      <InteractiveMap
+        bottomInset={sheetHeight}
+        focus={mapFocus}
+        markers={markers}
+        onMarkerPress={(marker) =>
+          router.push({
+            pathname: '/place',
+            params: {
+              name: marker.label,
+              lat: String(marker.latitude),
+              lng: String(marker.longitude),
+            },
+          })
+        }
+        recenterKey={recenterKey}
+        styleId={mapStyleId}
+        userLocation={coords}
+      />
 
       <View
         pointerEvents="box-none"
         style={[styles.floatingHeader, { paddingTop: insets.top + 14 }]}>
         <View style={styles.brandRow}>
-          <AppText variant="brand">
-            my
-            <AppText color="green" variant="brand">
-              route
+          <View style={styles.brandGroup}>
+            <Image
+              accessibilityLabel="myroute logo"
+              contentFit="contain"
+              source={require('@/assets/images/logo.png')}
+              style={styles.brandLogo}
+            />
+            <AppText variant="brand">
+              my
+              <AppText color="green" variant="brand">
+                route
+              </AppText>
             </AppText>
-          </AppText>
+          </View>
           <View>
             <RoundButton
               accessibilityLabel="Community notifications"
@@ -91,21 +171,31 @@ export default function ExploreScreen() {
           </AppText>
         </Tap>
 
-        <ScrollView
-          contentContainerStyle={styles.quickRow}
-          horizontal
-          showsHorizontalScrollIndicator={false}>
-          <QuickPill icon="home" label="Home" onPress={() => router.push('/route')} />
-          <QuickPill icon="shop" label="Work" onPress={() => router.push('/route')} tone="amber" />
-          <QuickPill
-            icon="bookmark"
-            label="Saved"
-            onPress={() => router.navigate('/saved')}
-          />
-        </ScrollView>
+        {permission === 'denied' || error ? (
+          <Tap
+            accessibilityLabel="Turn on location"
+            onPress={() => {
+              void start();
+            }}
+            style={styles.locationNotice}>
+            <Icon color={Palette.red} name="locate" size={14} />
+            <AppText color="muted" size={11} style={styles.locationNoticeText}>
+              {error ?? 'Location permission is needed to show exactly where you are.'}
+            </AppText>
+            <AppText color="green" size={11} weight="bold">
+              Enable
+            </AppText>
+          </Tap>
+        ) : null}
       </View>
 
       <View pointerEvents="box-none" style={[styles.mapActions, { bottom: sheetHeight + 12 }]}>
+        <RoundButton
+          accessibilityLabel="Draw a path on the map"
+          icon="plus"
+          iconColor={Palette.green}
+          onPress={() => router.push('/draw-path')}
+        />
         <RoundButton
           accessibilityLabel={`Map style: ${MAP_STYLES[mapStyleId].label}. Switch map style`}
           icon="layers"
@@ -119,10 +209,10 @@ export default function ExploreScreen() {
           onPress={() => setMapFocus(showCountry ? 'gaborone' : 'botswana')}
         />
         <RoundButton
-          accessibilityLabel="Recentre the map on Gaborone"
+          accessibilityLabel="Recentre the map on my location"
           icon="locate"
           iconColor={Palette.blue}
-          onPress={() => setMapFocus('gaborone')}
+          onPress={recentre}
         />
       </View>
 
@@ -131,26 +221,20 @@ export default function ExploreScreen() {
         <SectionHeading
           action={<TextButton label="See all" onPress={() => router.push('/search')} />}
           eyebrow="Near you"
-          title="Explore Gaborone"
+          title="Explore Botswana"
         />
-        <View style={styles.categoryRow}>
-          {exploreCategories.map((category, index) => (
-            <CategoryTile
-              icon={category.icon}
-              key={category.label}
-              label={category.label}
-              onPress={() => router.push('/search')}
-              tone={categoryTones[index]}
-            />
-          ))}
-        </View>
-        <FeaturedPlaceCard
-          image={shopImage}
-          onPress={() =>
-            router.push({ pathname: '/place', params: { name: featuredPlace.name } })
-          }
-          place={featuredPlace}
-        />
+        {markers.length === 0 ? (
+          <View style={styles.empty}>
+            <Icon color={Palette.green} name="map" size={24} />
+            <AppText color="muted" size={11} style={styles.emptyText}>
+              No community places yet. Add the first one and it will show up here once approved.
+            </AppText>
+          </View>
+        ) : (
+          <AppText color="muted" size={11} style={styles.emptyText}>
+            {markers.length} approved community place{markers.length === 1 ? '' : 's'} on the map.
+          </AppText>
+        )}
       </View>
     </View>
   );
@@ -165,7 +249,16 @@ const styles = StyleSheet.create({
     right: 0,
     paddingHorizontal: 18,
   },
-  brandRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  brandRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  // The logo is a square, full-bleed image: keep the box square so the artwork
+  // fills it and the wordmark sits directly beside it (a wide box letterboxes
+  // the square and leaves a gap that pushes the text away from the mark).
+  brandLogo: { width: 40, height: 40 },
+  brandGroup: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   notificationDot: {
     position: 'absolute',
     top: 8,
@@ -190,26 +283,20 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.surface,
     ...Shadows.card,
   },
-  quickRow: { paddingVertical: 12, gap: 8 },
-  quickPill: {
-    height: 36,
-    paddingLeft: 8,
-    paddingRight: 13,
+  locationNotice: {
+    marginTop: 2,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
     borderWidth: 1,
-    borderColor: '#DCE3DD',
-    borderRadius: 20,
+    borderColor: 'rgba(232,76,61,0.25)',
+    borderRadius: 12,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 7,
-    backgroundColor: 'rgba(255,255,255,0.94)',
+    gap: 8,
+    backgroundColor: 'rgba(255,255,255,0.96)',
+    ...Shadows.subtle,
   },
-  quickDot: {
-    width: 25,
-    height: 25,
-    borderRadius: 13,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  locationNoticeText: { flex: 1, lineHeight: 14 },
   mapActions: { position: 'absolute', right: 15, gap: 10 },
   sheet: {
     position: 'absolute',
@@ -224,5 +311,17 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.surface,
     ...Shadows.sheet,
   },
-  categoryRow: { flexDirection: 'row', marginVertical: 18, gap: 8 },
+  empty: {
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#CAD5CC',
+    borderRadius: Radius.lg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: '#FAFCF9',
+  },
+  emptyText: { flex: 1, lineHeight: 15 },
 });

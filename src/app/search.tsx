@@ -1,11 +1,11 @@
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useMemo, useState } from 'react';
-import { ScrollView, StyleSheet, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/myroute/icon';
-import { ListRow, PlaceResultRow } from '@/components/myroute/rows';
+import { ListRow } from '@/components/myroute/rows';
 import { AppText } from '@/components/myroute/text';
 import {
   BareIconButton,
@@ -15,23 +15,59 @@ import {
   TextField,
 } from '@/components/myroute/ui';
 import { Palette, Radius, Shadows } from '@/constants/theme';
-import { places, recentSearches } from '@/data/myroute';
+import { searchBotswana, type SearchResult } from '@/lib/search';
+
+const DEBOUNCE_MS = 350;
 
 export default function SearchScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const [query, setQuery] = useState('');
+  const [remote, setRemote] = useState<SearchResult[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const trimmed = query.trim();
-  const matches = useMemo(() => {
-    const needle = trimmed.toLowerCase();
-    return places.filter((place) => `${place.name} ${place.area}`.toLowerCase().includes(needle));
+
+  // Debounced remote search.
+  useEffect(() => {
+    if (trimmed.length < 2) {
+      // Nothing to search yet; the render already hides stale remote results.
+      return;
+    }
+
+    const id = ++requestId.current;
+
+    const timer = setTimeout(() => {
+      setLoading(true);
+      setError(null);
+      searchBotswana(trimmed)
+        .then((results) => {
+          if (id !== requestId.current) {
+            return;
+          }
+          setRemote(results);
+        })
+        .catch((err: Error) => {
+          if (id !== requestId.current) {
+            return;
+          }
+          setError(err.message);
+          setRemote([]);
+        })
+        .finally(() => {
+          if (id === requestId.current) {
+            setLoading(false);
+          }
+        });
+    }, DEBOUNCE_MS);
+
+    return () => clearTimeout(timer);
   }, [trimmed]);
 
-  const askingForRotterdam = trimmed.toLowerCase().includes('rotterdam');
-  const results = matches.length > 0 ? matches : places.slice(0, 1);
-
-  const openPlace = (name: string) => router.push({ pathname: '/place', params: { name } });
+  const showRemote = trimmed.length > 1 && remote.length > 0;
+  const showEmpty = trimmed.length > 1 && !loading && !showRemote;
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
@@ -70,16 +106,9 @@ export default function SearchScreen() {
             <View style={styles.recentHeading}>
               <AppText variant="sectionTitleSmall">Recent searches</AppText>
             </View>
-            {recentSearches.map((item) => (
-              <ListRow
-                icon="search"
-                key={item}
-                onPress={() => setQuery(item)}
-                subtitle="Gaborone, Botswana"
-                title={item}
-                trailing={<Icon name="arrow" size={17} />}
-              />
-            ))}
+            <AppText color="muted" variant="small">
+              Your recent searches will appear here.
+            </AppText>
             <Tap
               accessibilityLabel="Browse popular places"
               onPress={() => router.navigate('/')}
@@ -106,20 +135,45 @@ export default function SearchScreen() {
           </>
         ) : (
           <>
-            <AppText color="muted" style={styles.resultCount} variant="small">
-              {matches.length || 1} places found
-            </AppText>
-            {results.map((place) => {
-              const name = askingForRotterdam ? 'Rotterdam Shop' : place.name;
-              return (
-                <PlaceResultRow
-                  key={place.name}
-                  onPress={() => openPlace(name)}
-                  place={askingForRotterdam ? { ...place, name } : place}
-                />
-              );
-            })}
-            {askingForRotterdam ? (
+            {loading ? (
+              <View style={styles.loadingRow}>
+                <ActivityIndicator color={Palette.green} />
+                <AppText color="muted" size={11}>
+                  Searching Botswana…
+                </AppText>
+              </View>
+            ) : null}
+
+            {showRemote
+              ? remote
+                  .map((hit) => (
+                    <ListRow
+                      icon="pin"
+                      key={`remote-${hit.placeId}`}
+                      onPress={() =>
+                        router.push({
+                          pathname: '/place',
+                          params: {
+                            name: hit.name,
+                            lat: String(hit.latitude),
+                            lng: String(hit.longitude),
+                          },
+                        })
+                      }
+                      subtitle={hit.displayName}
+                      title={hit.name}
+                      trailing={<Icon name="chevron" size={17} />}
+                    />
+                  ))
+              : null}
+
+            {error ? (
+              <AppText color="red" size={11} style={styles.errorText}>
+                {error}
+              </AppText>
+            ) : null}
+
+            {showEmpty ? (
               <View style={styles.missing}>
                 <Icon color={Palette.green} name="map" size={38} />
                 <AppText size={13} weight="bold" style={styles.missingTitle}>
@@ -200,7 +254,13 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.green,
   },
   discoverCopy: { flex: 1, gap: 3 },
-  resultCount: { marginBottom: 9 },
+  loadingRow: {
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  errorText: { marginTop: 12 },
   missing: {
     marginTop: 25,
     paddingHorizontal: 14,

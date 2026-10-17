@@ -8,33 +8,57 @@
     "scheme": "myroute",
     "userInterfaceStyle": "light",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/images/icon.png"
     },
     "android": {
+      "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
-        "backgroundColor": "#E8F6ED",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+        "backgroundColor": "#F6F6F6",
+        "foregroundImage": "./assets/images/android-icon-foreground.png"
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.naledistar.myroute"
     },
     "web": {
       "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "favicon": "./assets/images/logo.png"
     },
     "plugins": [
       "expo-router",
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#078C4B",
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 76
+          "backgroundColor": "#F6F6F6",
+          "image": "./assets/images/logo.png",
+          "imageWidth": 140
         }
       ],
-      "@maplibre/maplibre-react-native"
+      "@maplibre/maplibre-react-native",
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "myroute uses your location to show you on the map and guide you to a place.",
+          "locationAlwaysAndWhenInUsePermission": "myroute keeps using your location in the background so turn-by-turn navigation keeps running while your phone is locked.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      "expo-task-manager",
+      [
+        "expo-notifications",
+        {
+          "color": "#078C4B"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "myroute needs your photos so you can add a picture of a place.",
+          "cameraPermission": "myroute needs the camera so you can photograph a place."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

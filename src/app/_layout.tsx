@@ -11,6 +11,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 
 import { Palette } from '@/constants/theme';
+import { syncLocalContributions } from '@/lib/api';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -28,6 +29,12 @@ export default function RootLayout() {
       SplashScreen.hideAsync();
     }
   }, [ready]);
+
+  // Places and paths belong to the community database, not to one device. Push
+  // anything recorded while offline as soon as the app opens.
+  useEffect(() => {
+    void syncLocalContributions();
+  }, []);
 
   if (!ready) {
     return null;

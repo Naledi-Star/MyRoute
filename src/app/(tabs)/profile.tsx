@@ -1,20 +1,27 @@
 import { LinearGradient } from 'expo-linear-gradient';
+import { useRouter } from 'expo-router';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/myroute/icon';
+import { InteractiveMap } from '@/components/myroute/interactive-map';
 import { AppText } from '@/components/myroute/text';
-import { Palette } from '@/constants/theme';
+import { Tap } from '@/components/myroute/ui';
+import { Palette, Radius } from '@/constants/theme';
 import { profile } from '@/data/myroute';
+import { useDeviceLocation } from '@/lib/location';
 
 export default function ProfileScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
+  const { coords } = useDeviceLocation({ auto: true });
+
+  // A contributor's pins come from the backend once auth is wired. Until then
+  // the map shows only the user's current position, not invented places.
 
   return (
     <View style={styles.screen}>
-      <ScrollView
-        contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}>
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <LinearGradient
           colors={['#E8F6ED', '#F8FBF8']}
           end={{ x: 1, y: 1 }}
@@ -41,9 +48,40 @@ export default function ProfileScreen() {
           </View>
         </LinearGradient>
 
+        {/* NEW: contribution footprint */}
+        <View style={styles.footprint}>
+          <View style={styles.footprintHeader}>
+            <AppText size={13} weight="bold">
+              Your contribution footprint
+            </AppText>
+            <AppText color="muted" size={10}>
+              Gaborone
+            </AppText>
+          </View>
+          <View style={styles.footprintMap}>
+            <InteractiveMap
+              bottomInset={0}
+              focus="gaborone"
+              markers={[]}
+              styleId="positron"
+              userLocation={coords}
+            />
+          </View>
+        </View>
+
         <View style={styles.menu}>
           {profile.menu.map((item) => (
-            <View key={item.label} style={styles.menuRow}>
+            <Tap
+              accessibilityLabel={item.label}
+              key={item.label}
+              onPress={() => {
+                if (item.label === 'Offline maps') {
+                  router.push('/offline');
+                } else if (item.label === 'Messages') {
+                  router.push('/chat');
+                }
+              }}
+              style={styles.menuRow}>
               <View style={styles.menuIcon}>
                 <Icon color={Palette.green} name={item.icon} size={19} />
               </View>
@@ -51,7 +89,7 @@ export default function ProfileScreen() {
                 {item.label}
               </AppText>
               <Icon name="chevron" size={18} />
-            </View>
+            </Tap>
           ))}
         </View>
       </ScrollView>
@@ -85,6 +123,19 @@ const styles = StyleSheet.create({
   },
   stat: { flex: 1, alignItems: 'center', gap: 3 },
   statDivider: { borderLeftWidth: 1, borderLeftColor: '#D4E4D8' },
+  footprint: { paddingHorizontal: 16, paddingTop: 18 },
+  footprintHeader: {
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  footprintMap: {
+    height: 200,
+    borderRadius: Radius.lg,
+    overflow: 'hidden',
+    backgroundColor: Palette.mapBase,
+  },
   menu: { paddingVertical: 17, paddingHorizontal: 19 },
   menuRow: {
     minHeight: 61,

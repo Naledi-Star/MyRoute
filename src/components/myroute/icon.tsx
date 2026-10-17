@@ -4,6 +4,7 @@ import Svg, { Circle, Path } from 'react-native-svg';
 import { Palette } from '@/constants/theme';
 
 export type IconName =
+  | 'alert'
   | 'arrow'
   | 'back'
   | 'bell'
@@ -11,6 +12,7 @@ export type IconName =
   | 'bookmark'
   | 'camera'
   | 'car'
+  | 'chat'
   | 'check'
   | 'chevron'
   | 'church'
@@ -22,18 +24,27 @@ export type IconName =
   | 'locate'
   | 'map'
   | 'menu'
+  | 'minibus'
   | 'more'
   | 'pin'
   | 'plus'
   | 'request'
   | 'search'
+  | 'send'
   | 'share'
   | 'shop'
+  | 'trash'
   | 'user'
   | 'walk';
 
 /** The wireframe icon set, drawn with the same 24x24 outlines. */
 const paths: Record<IconName, ReactNode> = {
+  alert: (
+    <>
+      <Path d="M12 4 2.6 20h18.8L12 4Z" />
+      <Path d="M12 10v4M12 17.4v.01" />
+    </>
+  ),
   arrow: (
     <>
       <Path d="M12 19V5" />
@@ -66,6 +77,12 @@ const paths: Record<IconName, ReactNode> = {
       <Path d="m5 17-1 2v2h3v-2h10v2h3v-2l-1-2-2-6H7Z" />
       <Circle cx={7.5} cy={16.5} r={1} />
       <Circle cx={16.5} cy={16.5} r={1} />
+    </>
+  ),
+  chat: (
+    <>
+      <Path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5Z" />
+      <Path d="M9 11v1M12.5 11v1M16 11v1" />
     </>
   ),
   check: <Path d="m5 12 4 4L19 6" />,
@@ -121,6 +138,17 @@ const paths: Record<IconName, ReactNode> = {
       <Path d="M4 7h16M4 12h16M4 17h16" />
     </>
   ),
+  minibus: (
+    <>
+      {/* A combi: tall boxy body, a long side window band, two wheels. */}
+      <Path d="M4 16.5V7.2A2.2 2.2 0 0 1 6.2 5h7.9c.5 0 .9.2 1.3.5l3.6 3.4c.3.3.7.4 1.1.4h.5A2.5 2.5 0 0 1 21.5 11.8v4.7" />
+      <Path d="M3.4 16.5h18.2" />
+      <Path d="M6.4 9.4h11.9" />
+      <Path d="M11.2 9.4v2.6" />
+      <Circle cx="7.5" cy="16.5" r="2" />
+      <Circle cx="16.8" cy="16.5" r="2" />
+    </>
+  ),
   more: null,
   pin: (
     <>
@@ -153,10 +181,17 @@ const paths: Record<IconName, ReactNode> = {
       <Path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4" />
     </>
   ),
+  send: <Path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7Z" />,
   shop: (
     <>
       <Path d="M4 10v11h16V10M3 4h18l-1 6a3 3 0 0 1-5 1 3 3 0 0 1-6 0 3 3 0 0 1-5-1Z" />
       <Path d="M9 21v-6h6v6" />
+    </>
+  ),
+  trash: (
+    <>
+      <Path d="M4 7h16M10 11v6M14 11v6" />
+      <Path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13M9 7V4h6v3" />
     </>
   ),
   user: (
