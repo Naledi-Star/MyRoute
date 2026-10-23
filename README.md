@@ -25,6 +25,34 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Backend
+
+The community features (places, recorded paths, combi routes, chat, photos,
+search) talk to the MyRoute API in `../backend/` when `EXPO_PUBLIC_API_URL` is
+set, e.g.
+
+```bash
+EXPO_PUBLIC_API_URL=http://192.168.1.20:3000 npx expo start
+```
+
+Every request goes through `src/lib/api.ts` and `src/lib/chat.ts` — no screen
+fetches on its own — and uses the versioned `/api/v1` base path. Without the
+variable the app still works fully offline: contributions are kept on the device
+with a `local` status and retried on the next launch under the same id, so a
+retry never duplicates a contribution.
+
+- **Photos** are compressed on the device (long edge ≤ 1600 px, JPEG, target
+  500 KB, hard limit 1 MB) before a signature is requested, then uploaded
+directly to object storage and confirmed so the server can verify the object.
+- **Search** goes through the API (which owns the cache and the geocoder's usage
+  policy) and falls back to calling Nominatim directly only if the API is
+  unreachable.
+- **Routing and tiles** stay on the device. Their base URLs live in
+  `src/constants/map.ts` (`OSRM_BASE_URL`, the OpenFreeMap style URLs), so
+  self-hosting either is a configuration change.
+
+See `../backend/README.md` for the API contract, security model and deployment.
+
 ## Interactive map
 
 The Explore tab renders a real map with [MapLibre](https://maplibre.org): MapLibre Native

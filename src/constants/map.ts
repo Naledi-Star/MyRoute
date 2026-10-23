@@ -72,6 +72,26 @@ export const MAP_PROVIDER: MapProvider = {
 export const OSM_RASTER_ATTRIBUTION = '© OpenStreetMap contributors';
 
 /**
+ * Routing engine (OSRM).
+ *
+ * This is the public demo server: it has no SLA and is not for production.
+ * Self-hosting OSRM for a Botswana extract is a documented follow-up, and it
+ * changes this constant only — no app code. Keep the base URL here so no other
+ * module has to know which routing engine is in use.
+ */
+export const OSRM_BASE_URL = 'https://router.project-osrm.org';
+
+/**
+ * Geocoder fallback (Nominatim).
+ *
+ * Search normally goes through the MyRoute API (`/api/v1/search`), which owns
+ * the cache, the 1 req/s policy and the User-Agent. This direct URL is used only
+ * when no API is configured or the proxy is unreachable, so search still works
+ * on a device that has lost the community backend.
+ */
+export const NOMINATIM_BASE_URL = 'https://nominatim.openstreetmap.org';
+
+/**
  * Emergency fallback: a plain OSM raster tile style. Used when the vector
  * provider is unreachable (offline, blocked, or rate-limited). The raster style
  * is deliberately minimal — one source, one layer — so it loads fast even on a

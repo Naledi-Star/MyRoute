@@ -15,6 +15,7 @@
     "expo-font": "~57.0.4",
     "expo-glass-effect": "~57.0.4",
     "expo-image": "~57.0.5",
+    "expo-image-manipulator": "~57.0.21",
     "expo-image-picker": "~57.0.20",
     "expo-linear-gradient": "~57.0.2",
     "expo-linking": "~57.0.13",
@@ -55,7 +56,8 @@
     "web": "expo start --web",
     "web:export": "expo export --platform web",
     "map:worker": "node ./scripts/sync-map-worker.cjs",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "test:photo": "node --test tests/photo-limits.test.mjs"
   },
   "private": true
 }

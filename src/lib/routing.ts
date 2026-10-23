@@ -1,3 +1,5 @@
+import { OSRM_BASE_URL } from '@/constants/map';
+
 export type TravelProfile = 'car' | 'bike' | 'foot';
 
 /** A single manoeuvre in a turn-by-turn route. */
@@ -27,7 +29,8 @@ const OSRM_PROFILES: Record<TravelProfile, string> = {
   foot: 'walking',
 };
 
-const OSRM_BASE = 'https://router.project-osrm.org/route/v1';
+/** Provider lives in `src/constants/map.ts`; swapping it is a one-line change. */
+const OSRM_BASE = `${OSRM_BASE_URL}/route/v1`;
 
 type OsrmStep = {
   distance: number;
@@ -94,8 +97,9 @@ function toSteps(route: OsrmRoute): RouteStep[] {
 /**
  * Query OSRM for a route through two or more waypoints.
  *
- * The public OSRM demo server is fine for development and light use, but has no
- * SLA. For production, self-host OSRM (or Valhalla) on a free tier.
+ * The base URL comes from `src/constants/map.ts` and currently points at the
+ * public OSRM demo server — fine for development and light use, but with no
+ * SLA. A self-hosted OSRM for a Botswana extract is the documented follow-up.
  *
  * @param waypoints At least two `[lng, lat]` points; more makes a multi-leg route,
  *   which is what "snap my drawn path to roads" uses.

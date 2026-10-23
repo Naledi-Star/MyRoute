@@ -49,6 +49,12 @@ export type PathKind = 'path' | 'combi';
  */
 export type SavedPath = {
   id: string;
+  /**
+   * The server's uuid, once the contribution has been accepted. The local id
+   * stays the dedupe key (retries send it as `clientId`); this is stored so the
+   * server record can be recognised later without changing that.
+   */
+  serverId?: string;
   name: string;
   profile: TravelProfile;
   /** Raw captured or tapped vertices, [lng, lat]. */

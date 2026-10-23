@@ -157,30 +157,42 @@ async function storeMessages(threadId: string, messages: ChatMessage[]): Promise
   await write(MESSAGES_KEY, all);
 }
 
+/** A message as the API returns it: camelCase fields, ISO 8601 timestamp. */
 type MessageRow = {
   id: string;
-  thread_id?: string;
-  author_id?: string | null;
-  author_name?: string | null;
+  threadId?: string;
+  authorId?: string | null;
+  authorName?: string | null;
   kind?: string | null;
   body?: string | null;
   latitude?: number | null;
   longitude?: number | null;
-  created_at?: number;
+  createdAt?: string | number;
 };
 
+/**
+ * The app works in epoch milliseconds (`createdAt` is a number everywhere in
+ * the UI), so the ISO 8601 string from the API is converted here, at the
+ * boundary — not in the screens.
+ */
 function fromRow(row: MessageRow, threadId: string): ChatMessage {
   const kind = row.kind === 'location' ? 'location' : 'text';
+  const createdAt =
+    typeof row.createdAt === 'number'
+      ? row.createdAt
+      : typeof row.createdAt === 'string'
+        ? Date.parse(row.createdAt)
+        : Date.now();
   return {
     id: String(row.id),
-    threadId: row.thread_id ?? threadId,
-    authorId: String(row.author_id ?? ''),
-    authorName: String(row.author_name ?? 'Neighbour'),
+    threadId: row.threadId ?? threadId,
+    authorId: String(row.authorId ?? ''),
+    authorName: String(row.authorName ?? 'Neighbour'),
     kind,
     body: String(row.body ?? ''),
     latitude: row.latitude ?? undefined,
     longitude: row.longitude ?? undefined,
-    createdAt: Number(row.created_at ?? Date.now()),
+    createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
   };
 }
 
@@ -192,10 +204,37 @@ async function push(message: ChatMessage): Promise<void> {
     const response = await fetch(`${API_BASE}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(message),
+      body: JSON.stringify({
+        // The local id is the idempotency key: a retried send replaces rather
+        // than duplicates.
+        clientId: message.id,
+        threadId: message.threadId,
+        authorId: message.authorId,
+        authorName: message.authorName,
+        kind: message.kind,
+        body: message.body,
+        latitude: message.latitude,
+        longitude: message.longitude,
+      }),
     });
     if (!response.ok) {
       throw new Error(`messages failed (${response.status})`);
+    }
+
+    // Adopt the server's timestamp. The poll cursor is derived from the newest
+    // local message, and a device clock ahead of the server would otherwise
+    // make every later message look older than the cursor and never fetch it.
+    const saved = (await response.json()) as MessageRow;
+    const serverTime =
+      typeof saved.createdAt === 'string' ? Date.parse(saved.createdAt) : Number(saved.createdAt);
+    if (Number.isFinite(serverTime) && serverTime !== message.createdAt) {
+      const stored = await loadMessages(message.threadId);
+      await storeMessages(
+        message.threadId,
+        stored.map((existing) =>
+          existing.id === message.id ? { ...existing, createdAt: serverTime } : existing,
+        ),
+      );
     }
   } catch {
     // Offline: the message stays on the device and the next sync retries it.
@@ -246,7 +285,7 @@ export function sendLocation(
 }
 
 /**
- * Pull anything new from the Worker and merge it into the local thread.
+ * Pull anything new from the API and merge it into the local thread.
  * Without a backend this is just the local list.
  */
 export async function syncMessages(threadId: string): Promise<ChatMessage[]> {
@@ -262,7 +301,8 @@ export async function syncMessages(threadId: string): Promise<ChatMessage[]> {
     if (!response.ok) {
       throw new Error(`messages failed (${response.status})`);
     }
-    const rows = (await response.json()) as MessageRow[];
+    const body = (await response.json()) as { data?: MessageRow[] };
+    const rows = Array.isArray(body.data) ? body.data : [];
     const merged = [...local];
     rows.forEach((row) => {
       const message = fromRow(row, threadId);

@@ -34,7 +34,7 @@ import {
 } from '@/lib/chat';
 import { getCurrentCoords } from '@/lib/location';
 
-/** How often to ask the Worker for new messages when a backend is configured. */
+/** How often to poll the API for new messages when a backend is configured. */
 const POLL_MS = 6000;
 
 export default function ThreadScreen() {
@@ -54,7 +54,7 @@ export default function ThreadScreen() {
   const [notice, setNotice] = useState<string | null>(null);
   const scrollRef = useRef<ScrollView>(null);
 
-  // Load what is on the device, then ask the Worker for anything newer.
+  // Load what is on the device, then ask the API for anything newer.
   useEffect(() => {
     let active = true;
     const refresh = async () => {

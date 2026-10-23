@@ -1,22 +1,27 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import { savedPathsFromCombiRoutes, type ApiCombiRoute } from './combi';
 import { addPath, loadPaths, type SavedPath } from './paths';
+import { preparePhotoForUpload } from './photo-upload';
+import type { TravelProfile } from './routing';
 
 /**
- * Thin client for the myroute Cloudflare Worker.
+ * Thin client for the MyRoute API (the Express server in `backend/`).
  *
- * The Worker lives in `server/` and owns the D1 database, R2 photo buckets and
- * the Clerk-authenticated endpoints. Until `EXPO_PUBLIC_API_URL` is set the app
- * runs entirely locally: contributions are stored on the device with a
- * `pending` status so the review queue and offline behaviour can still be
- * exercised end-to-end.
+ * Everything the app knows about the network lives here or in `chat.ts`: no
+ * screen fetches directly, so there is one place that owns the base URL, the
+ * response envelope, idempotency keys and error handling.
+ *
+ * Without `EXPO_PUBLIC_API_URL` the app runs entirely locally: contributions
+ * are stored on the device with a `local` status so the review queue and the
+ * offline behaviour still work end to end.
  */
 const BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? '').replace(/\/+$/, '');
 
 export const hasBackend = BASE_URL.length > 0;
 
-/** Exported so other modules (chat) can reach the same Worker. */
-export const API_BASE = BASE_URL;
+/** Versioned API root. Every request goes through here. */
+export const API_BASE = BASE_URL.length > 0 ? `${BASE_URL}/api/v1` : '';
 
 export type ContributionStatus = 'local' | 'pending' | 'approved' | 'rejected';
 
@@ -31,7 +36,9 @@ export type PendingPlace = {
   longitude: number;
   status: ContributionStatus;
   createdAt: number;
-  /** Optional signed-in user id (Clerk `sub`), when accounts are enabled. */
+  /** The server's uuid once accepted; the local `id` remains the dedupe key. */
+  serverId?: string;
+  /** Optional opaque contributor id, when accounts are enabled. */
   contributorId?: string;
 };
 
@@ -52,28 +59,143 @@ export type CommunityPlace = {
 
 const PENDING_KEY = 'myroute:pending-places';
 
-/** Auth token supplied by the auth layer once Clerk is wired. */
-let authToken: string | null = null;
+/** An API failure with the server's stable code, so callers can react to it. */
+export class ApiRequestError extends Error {
+  status: number;
+  code: string;
 
-export function setAuthToken(token: string | null): void {
-  authToken = token;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+    this.code = code;
+  }
 }
 
-async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set('Content-Type', 'application/json');
-  if (authToken) {
-    headers.set('Authorization', `Bearer ${authToken}`);
+  if (init.body != null) {
+    headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(`${BASE_URL}${path}`, { ...init, headers });
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!response.ok) {
-    throw new Error(`API ${path} failed (${response.status})`);
+    let code = `http_${response.status}`;
+    let message = `Request failed (${response.status}).`;
+    try {
+      const body = (await response.json()) as { error?: { code?: string; message?: string } };
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // Non-JSON error (proxy, offline). Keep the status-based message.
+    }
+    throw new ApiRequestError(response.status, code, message);
   }
   return (await response.json()) as T;
 }
 
-// ── Pending places (local queue) ─────────────────────────────────────────────
+// ── Wire shapes (server records) ────────────────────────────────────────────
+
+type LineString = { type: 'LineString'; coordinates: [number, number][] };
+
+type ApiList<T> = { data: T[]; meta: Record<string, unknown> };
+
+type ApiPlaceRecord = {
+  id: string;
+  clientId: string | null;
+  name: string;
+  category: string;
+  description: string;
+  area: string;
+  latitude: number;
+  longitude: number;
+  status: ContributionStatus;
+  createdAt: string;
+  distanceMetres?: number;
+};
+
+type ApiPathRecord = {
+  id: string;
+  clientId: string | null;
+  kind: 'path';
+  name: string;
+  profile: string;
+  source: 'recorded' | 'drawn' | null;
+  vertices: LineString | null;
+  coordinates: LineString | null;
+  snapped: boolean;
+  distanceMetres: number;
+  durationSeconds: number;
+  status: ContributionStatus;
+  createdAt: string;
+};
+
+/** ISO 8601 from the API → the epoch milliseconds the app already uses. */
+function toMillis(value: string | number | undefined | null, fallback = 0): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function toTravelProfile(value: string): TravelProfile {
+  return value === 'car' || value === 'bike' || value === 'foot' ? value : 'foot';
+}
+
+function toCommunityPlace(record: ApiPlaceRecord): CommunityPlace {
+  return {
+    id: record.id,
+    name: record.name,
+    category: record.category,
+    description: record.description,
+    area: record.area ?? '',
+    latitude: record.latitude,
+    longitude: record.longitude,
+    status: record.status,
+    // The app works in epoch milliseconds everywhere; the API speaks ISO 8601.
+    createdAt: toMillis(record.createdAt),
+    ...(record.distanceMetres != null ? { distanceMetres: record.distanceMetres } : {}),
+  };
+}
+
+function toSavedPath(record: ApiPathRecord): SavedPath | null {
+  const vertices = record.vertices?.coordinates ?? [];
+  if (!Array.isArray(vertices) || vertices.length < 2) {
+    return null;
+  }
+  const snapped = record.coordinates?.coordinates ?? [];
+  return {
+    // The device's own id, when the server has one, so the community copy
+    // merges with the local copy instead of appearing twice.
+    id: record.clientId?.trim() || record.id,
+    serverId: record.id,
+    name: record.name,
+    profile: toTravelProfile(record.profile),
+    vertices,
+    coordinates: snapped.length >= 2 ? snapped : vertices,
+    snapped: record.snapped === true && snapped.length >= 2,
+    distanceMetres: Number(record.distanceMetres ?? 0),
+    durationSeconds: Number(record.durationSeconds ?? 0),
+    createdAt: toMillis(record.createdAt, Date.now()),
+    status: 'approved',
+    kind: 'path',
+    ...(record.source ? { source: record.source } : {}),
+  };
+}
+
+function toLineString(coordinates: [number, number][] | undefined): LineString | undefined {
+  return Array.isArray(coordinates) && coordinates.length >= 2
+    ? { type: 'LineString', coordinates }
+    : undefined;
+}
+
+// ── Pending places (local queue) ────────────────────────────────────────────
 
 export async function loadPendingPlaces(): Promise<PendingPlace[]> {
   try {
@@ -88,10 +210,14 @@ export async function loadPendingPlaces(): Promise<PendingPlace[]> {
   }
 }
 
+async function storePendingPlaces(places: PendingPlace[]): Promise<void> {
+  await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(places));
+}
+
 /**
- * Submit a place. With a backend configured this POSTs to the Worker (which
- * files it as `pending` in D1 for the review dashboard); offline or without a
- * backend it is queued locally so nothing is lost.
+ * Submit a place. With a backend configured this POSTs to the API (filed as
+ * `pending` for moderation); offline or without a backend it is queued locally
+ * so nothing is lost. `clientId` is the local id, so retries never duplicate.
  */
 export async function submitPlace(
   place: Omit<PendingPlace, 'id' | 'status' | 'createdAt'>,
@@ -105,11 +231,19 @@ export async function submitPlace(
 
   if (hasBackend) {
     try {
-      const saved = await apiRequest<PendingPlace>('/places', {
+      const saved = await request<ApiPlaceRecord>('/places', {
         method: 'POST',
-        body: JSON.stringify(record),
+        body: JSON.stringify({
+          clientId: record.id,
+          name: record.name,
+          category: record.category,
+          description: record.description,
+          area: record.area,
+          latitude: record.latitude,
+          longitude: record.longitude,
+        }),
       });
-      return saved;
+      return { ...record, status: 'pending', serverId: saved.id };
     } catch {
       // Fall through to the local queue so the contribution is not lost.
       record.status = 'local';
@@ -117,28 +251,77 @@ export async function submitPlace(
   }
 
   const pending = await loadPendingPlaces();
-  await AsyncStorage.setItem(PENDING_KEY, JSON.stringify([record, ...pending]));
+  await storePendingPlaces([record, ...pending]);
   return record;
 }
 
 /**
- * Send a recorded path (or combi route) to the community database.
+ * Send a recorded path or combi route to the community database.
  *
- * Paths are community property: the same recording that becomes the rider's own
- * saved line is also the line everybody else can search. When the upload fails
- * the path stays on the device and `syncLocalContributions` retries it, so the
- * database is the destination rather than the device.
+ * Paths go to `/paths`; combi routes go to `/combi-routes` (they are first-class
+ * records with ordered stops, not personal recordings). Either way the local id
+ * travels as `clientId`, so a retry replaces rather than duplicates, and the
+ * app's own copy keeps its id — only the status and `serverId` change.
  */
 export async function submitPath(path: SavedPath): Promise<SavedPath> {
   if (!hasBackend) {
     return path;
   }
+
   try {
-    return await apiRequest<SavedPath>('/paths', {
+    if (path.kind === 'combi') {
+      const stops = (path.waypoints ?? []).filter(
+        (stop) =>
+          typeof stop.label === 'string' &&
+          stop.label.trim().length > 0 &&
+          Number.isFinite(stop.latitude) &&
+          Number.isFinite(stop.longitude),
+      );
+      if (stops.length < 2) {
+        return path;
+      }
+
+      const saved = await request<ApiCombiRoute>('/combi-routes', {
+        method: 'POST',
+        body: JSON.stringify({
+          clientId: path.id,
+          name: (path.combiName ?? '').trim() || path.name,
+          rank: path.rank ?? '',
+          description: '',
+          // Only a road-following line is sent as route geometry. An unsnapped
+          // GPS track is a stop list plus a track, not a verified road line.
+          geometry: path.snapped ? toLineString(path.coordinates) : undefined,
+          stops: stops.map((stop) => ({
+            clientId: stop.id,
+            label: stop.label.trim(),
+            latitude: stop.latitude,
+            longitude: stop.longitude,
+            fareFromPrevious: stop.fareFromPrevious ?? null,
+            accuracyM: stop.accuracy ?? undefined,
+            capturedAt: new Date(stop.capturedAt).toISOString(),
+          })),
+        }),
+      });
+      return { ...path, serverId: saved.id, status: 'pending' };
+    }
+
+    const saved = await request<ApiPathRecord>('/paths', {
       method: 'POST',
-      body: JSON.stringify(path),
+      body: JSON.stringify({
+        clientId: path.id,
+        name: path.name,
+        profile: path.profile,
+        source: path.source,
+        vertices: toLineString(path.vertices),
+        coordinates: path.snapped ? toLineString(path.coordinates) : undefined,
+        snapped: path.snapped,
+        distanceMetres: path.distanceMetres,
+        durationSeconds: path.durationSeconds,
+      }),
     });
+    return { ...path, serverId: saved.id, status: 'pending' };
   } catch {
+    // Stays local; `syncLocalContributions` retries on the next launch.
     return path;
   }
 }
@@ -149,32 +332,52 @@ export async function fetchCommunityPlaces(): Promise<CommunityPlace[]> {
     return [];
   }
   try {
-    const places = await apiRequest<CommunityPlace[]>('/places');
-    return Array.isArray(places) ? places.filter((place) => place.id != null) : [];
-  } catch {
-    return [];
-  }
-}
-
-/** Approved paths and combi routes contributed by the community. */
-export async function fetchCommunityPaths(): Promise<SavedPath[]> {
-  if (!hasBackend) {
-    return [];
-  }
-  try {
-    const paths = await apiRequest<SavedPath[]>('/paths');
-    return Array.isArray(paths) ? paths : [];
+    const body = await request<ApiList<ApiPlaceRecord>>('/places?limit=100');
+    return Array.isArray(body.data) ? body.data.map(toCommunityPlace) : [];
   } catch {
     return [];
   }
 }
 
 /**
+ * Approved paths and combi routes contributed by the community.
+ *
+ * Two endpoints, merged locally: `/paths` holds recordings, `/combi-routes`
+ * holds routes with ordered stops. A combi route is adapted into the app's
+ * `SavedPath` shape (stops as waypoints) so the combi screen and planner keep
+ * working unchanged.
+ */
+export async function fetchCommunityPaths(): Promise<SavedPath[]> {
+  if (!hasBackend) {
+    return [];
+  }
+
+  const [paths, combiRoutes] = await Promise.allSettled([
+    request<ApiList<ApiPathRecord>>('/paths?limit=100'),
+    request<ApiList<ApiCombiRoute>>('/combi-routes?limit=100'),
+  ]);
+
+  const merged: SavedPath[] = [];
+  if (paths.status === 'fulfilled' && Array.isArray(paths.value.data)) {
+    for (const record of paths.value.data) {
+      const mapped = toSavedPath(record);
+      if (mapped) {
+        merged.push(mapped);
+      }
+    }
+  }
+  if (combiRoutes.status === 'fulfilled' && Array.isArray(combiRoutes.value.data)) {
+    merged.push(...savedPathsFromCombiRoutes(combiRoutes.value.data));
+  }
+  return merged;
+}
+
+/**
  * Push anything that was recorded while offline to the database.
  *
- * Called when the app opens. Both loops are safe to repeat: places use an
- * idempotent insert and paths are stored as an upsert, so a retry cannot
- * duplicate or lose a contribution.
+ * Called when the app opens. Both loops are safe to repeat: places and paths
+ * send their existing local id as `clientId`, so a retry updates rather than
+ * duplicates.
  */
 export async function syncLocalContributions(): Promise<{ places: number; paths: number }> {
   if (!hasBackend) {
@@ -188,16 +391,27 @@ export async function syncLocalContributions(): Promise<{ places: number; paths:
       const remaining: PendingPlace[] = [];
       for (const place of queued) {
         try {
-          await apiRequest<PendingPlace>('/places', {
+          const saved = await request<ApiPlaceRecord>('/places', {
             method: 'POST',
-            body: JSON.stringify(place),
+            body: JSON.stringify({
+              clientId: place.id,
+              name: place.name,
+              category: place.category,
+              description: place.description,
+              area: place.area,
+              latitude: place.latitude,
+              longitude: place.longitude,
+            }),
           });
           places += 1;
+          if (!saved.id) {
+            remaining.push(place);
+          }
         } catch {
           remaining.push(place);
         }
       }
-      await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(remaining));
+      await storePendingPlaces(remaining);
     }
   } catch {
     // Storage is best-effort; the next launch tries again.
@@ -207,15 +421,10 @@ export async function syncLocalContributions(): Promise<{ places: number; paths:
   try {
     const local = (await loadPaths()).filter((path) => path.status === 'local');
     for (const path of local) {
-      try {
-        const saved = await apiRequest<SavedPath>('/paths', {
-          method: 'POST',
-          body: JSON.stringify(path),
-        });
-        await addPath(saved);
+      const synced = await submitPath(path);
+      if (synced.serverId) {
+        await addPath(synced);
         paths += 1;
-      } catch {
-        // Stays local and is retried on the next launch.
       }
     }
   } catch {
@@ -225,18 +434,69 @@ export async function syncLocalContributions(): Promise<{ places: number; paths:
   return { places, paths };
 }
 
-/** Upload a photo to R2 via a Worker-issued signed URL. */
-export async function uploadPhoto(localUri: string, ownerId: string): Promise<string> {
+// ── Photos ──────────────────────────────────────────────────────────────────
+
+export type PhotoOwnerType = 'place' | 'path' | 'combi_route' | 'combi_stop';
+
+type PhotoSignature = {
+  key: string;
+  uploadUrl: string;
+  method: 'PUT';
+  expiresIn: number;
+  contentType: string;
+};
+
+/**
+ * Upload one stop/place photo.
+ *
+ * The order is fixed by the backend contract: compress → sign → PUT straight to
+ * R2 → report success so the server can HEAD the object and create the row.
+ * Each attempt gets exactly one signature and uses it immediately; a failure is
+ * surfaced to the user rather than retried in the background, because every
+ * signature is rate-limited and billable.
+ */
+export async function uploadPhoto(
+  localUri: string,
+  ownerId: string,
+  ownerType: PhotoOwnerType = 'place',
+): Promise<string> {
   if (!hasBackend) {
     throw new Error('Photos need the myroute backend (set EXPO_PUBLIC_API_URL).');
   }
-  const { key, uploadUrl } = await apiRequest<{ key: string; uploadUrl: string }>(
-    '/photos/sign',
-    { method: 'POST', body: JSON.stringify({ ownerId }) },
-  );
 
-  const file = await fetch(localUri);
+  const prepared = await preparePhotoForUpload(localUri);
+
+  const signature = await request<PhotoSignature>('/photos/sign', {
+    method: 'POST',
+    body: JSON.stringify({
+      clientId: `photo-${Date.now().toString(36)}`,
+      ownerType,
+      ownerId,
+    }),
+  });
+
+  // Direct to R2 with the signed content type. No retry: a second PUT would
+  // overwrite the object inside the signature's 5-minute window.
+  const file = await fetch(prepared.uri);
   const blob = await file.blob();
-  await fetch(uploadUrl, { method: 'PUT', body: blob });
-  return key;
+  const uploaded = await fetch(signature.uploadUrl, {
+    method: signature.method,
+    headers: { 'Content-Type': signature.contentType },
+    body: blob,
+  });
+  if (!uploaded.ok) {
+    throw new ApiRequestError(
+      uploaded.status,
+      'photo_upload_failed',
+      'The photo could not be uploaded. Check your connection and try again.',
+    );
+  }
+
+  // The server verifies the object (size and type) before any row is created.
+  await request<{ key: string; status: string }>('/photos/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ key: signature.key }),
+  });
+
+  return signature.key;
 }

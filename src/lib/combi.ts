@@ -364,6 +364,130 @@ export function searchCombiRoutes(routes: CombiRoute[], query: string): CombiRou
 }
 
 /**
+ * A combi route as the API returns it (`GET /api/v1/combi-routes`).
+ *
+ * Kept structural rather than imported from the API layer so this module stays
+ * pure: the planner and its adapters must not depend on React or network code.
+ */
+export type ApiCombiStop = {
+  seq: number;
+  label: string;
+  latitude: number;
+  longitude: number;
+  fareFromPrevious: number | null;
+};
+
+export type ApiCombiRoute = {
+  id: string;
+  /** The id the contributing device minted; the app's dedupe key. */
+  clientId?: string | null;
+  name: string;
+  rank?: string;
+  origin?: string;
+  destination?: string;
+  geometry?: { type: 'LineString'; coordinates: [number, number][] } | null;
+  distanceMetres?: number | null;
+  stops?: ApiCombiStop[];
+  createdAt?: string | number;
+};
+
+/**
+ * Map routes from the API to the planner's `CombiRoute` shape.
+ *
+ * Community data is untrusted: a half-filled row must not put `NaN` into the
+ * distance maths, so stops are sorted by `seq` and validated, and a route with
+ * fewer than two usable stops is dropped rather than planned over.
+ */
+export function combiRoutesFromApi(records: ApiCombiRoute[]): CombiRoute[] {
+  const routes: CombiRoute[] = [];
+  for (const record of records) {
+    if (!record || typeof record.id !== 'string' || typeof record.name !== 'string') {
+      continue;
+    }
+    const name = record.name.trim();
+    if (name.length === 0) {
+      continue;
+    }
+    const stops = [...(record.stops ?? [])]
+      .sort((a, b) => Number(a.seq) - Number(b.seq))
+      .map((stop) =>
+        toCombiStop({
+          id: `stop-${stop.seq}`,
+          label: stop.label,
+          latitude: stop.latitude,
+          longitude: stop.longitude,
+          accuracy: null,
+          capturedAt: 0,
+          fareFromPrevious: stop.fareFromPrevious,
+        }),
+      )
+      .filter((stop): stop is CombiStop => stop != null);
+
+    if (stops.length < 2) {
+      continue;
+    }
+    routes.push({ id: record.id, name, rank: (record.rank ?? '').trim(), stops });
+  }
+  return routes;
+}
+
+/**
+ * Map API combi routes back to the app's `SavedPath` shape.
+ *
+ * The combi screen already merges community paths with local ones and feeds
+ * them to `combiRoutesFromPaths`, so community routes are adapted at the API
+ * boundary instead of teaching the screen or the planner a second shape. The
+ * stops become waypoints in travel order; the geometry (when the API has a
+ * verified line) is reused as both raw and snapped coordinates.
+ */
+export function savedPathsFromCombiRoutes(records: ApiCombiRoute[]): SavedPath[] {
+  const byId = new Map(records.map((record) => [record.id, record]));
+  return combiRoutesFromApi(records).map((route) => {
+    const record = byId.get(route.id);
+    const line =
+      record?.geometry && Array.isArray(record.geometry.coordinates) && record.geometry.coordinates.length >= 2
+        ? record.geometry.coordinates
+        : route.stops.map((stop) => [stop.longitude, stop.latitude] as [number, number]);
+    const createdAt =
+      typeof record?.createdAt === 'string'
+        ? Date.parse(record.createdAt)
+        : typeof record?.createdAt === 'number'
+          ? record.createdAt
+          : Date.now();
+    const waypoints: PathWaypoint[] = route.stops.map((stop, index) => ({
+      id: `${route.id}-stop-${index + 1}`,
+      label: stop.name,
+      latitude: stop.latitude,
+      longitude: stop.longitude,
+      accuracy: null,
+      capturedAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+      fareFromPrevious: stop.fareFromPrevious,
+    }));
+
+    return {
+      // Prefer the device's id so this record de-duplicates against the local
+      // copy the contributor already has; the server uuid is kept separately.
+      id: (record?.clientId ?? '').trim() || route.id,
+      serverId: route.id,
+      name: route.name,
+      profile: 'car',
+      vertices: line,
+      waypoints,
+      source: 'recorded',
+      kind: 'combi',
+      combiName: route.name,
+      rank: route.rank,
+      coordinates: line,
+      snapped: record?.geometry != null,
+      distanceMetres: Number(record?.distanceMetres ?? 0) || 0,
+      durationSeconds: 0,
+      createdAt,
+      status: 'approved',
+    };
+  });
+}
+
+/**
  * The combi network: paths a contributor saved as combi routes, with their
  * captured stops in travel order. This is the community's network — routes come
  * from the database, plus anything of the contributor's still on this device.
