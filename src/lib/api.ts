@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import Constants from 'expo-constants';
 
 import { savedPathsFromCombiRoutes, type ApiCombiRoute } from './combi';
 import { addPath, loadPaths, type SavedPath } from './paths';
@@ -12,16 +13,51 @@ import type { TravelProfile } from './routing';
  * screen fetches directly, so there is one place that owns the base URL, the
  * response envelope, idempotency keys and error handling.
  *
- * Without `EXPO_PUBLIC_API_URL` the app runs entirely locally: contributions
+ * Without a resolvable backend the app runs entirely locally: contributions
  * are stored on the device with a `local` status so the review queue and the
  * offline behaviour still work end to end.
  */
-const BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? '').replace(/\/+$/, '');
+
+/**
+ * Where the API lives.
+ *
+ * Production and preview builds pass the deployed URL in `EXPO_PUBLIC_API_URL`.
+ * During development that is normally left empty and the address is derived
+ * from whichever server delivered the app: Metro proxies `/api` to the backend
+ * (see metro.config.js), so the phone reaches the API over exactly the route
+ * it already reaches the bundle over — Wi-Fi, USB (`adb reverse`), an emulator
+ * or a tunnel. One reachable port is enough; a second port blocked by a
+ * firewall can no longer make the app look offline.
+ */
+function resolveApiBase(): string {
+  const explicit = (process.env.EXPO_PUBLIC_API_URL ?? '').replace(/\/+$/, '');
+  if (explicit.length > 0) {
+    return explicit;
+  }
+  const hostUri = Constants.expoConfig?.hostUri ?? '';
+  const host = hostUri.replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '');
+  return host.length > 0 ? `http://${host}` : '';
+}
+
+const BASE_URL = resolveApiBase();
 
 export const hasBackend = BASE_URL.length > 0;
 
 /** Versioned API root. Every request goes through here. */
 export const API_BASE = BASE_URL.length > 0 ? `${BASE_URL}/api/v1` : '';
+
+/**
+ * Dev-only breadcrumb, printed in the Metro terminal.
+ *
+ * A phone's view of the network is invisible from the development machine, so
+ * every request outcome is reported from the device itself; production builds
+ * compile it out.
+ */
+function devNote(message: string): void {
+  if (__DEV__) {
+    console.warn(`[myroute api] ${message}`);
+  }
+}
 
 export type ContributionStatus = 'local' | 'pending' | 'approved' | 'rejected';
 
@@ -78,7 +114,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    devNote(`network failure ${init.method ?? 'GET'} ${path} → ${BASE_URL}: ${reason}`);
+    throw new ApiRequestError(0, 'network_failure', 'Could not reach the myroute backend.');
+  }
   if (!response.ok) {
     let code = `http_${response.status}`;
     let message = `Request failed (${response.status}).`;
@@ -89,6 +132,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       // Non-JSON error (proxy, offline). Keep the status-based message.
     }
+    devNote(`rejected ${response.status} ${code} ${init.method ?? 'GET'} ${path}`);
     throw new ApiRequestError(response.status, code, message);
   }
   return (await response.json()) as T;
@@ -243,9 +287,11 @@ export async function submitPlace(
           longitude: record.longitude,
         }),
       });
+      devNote(`saved place ${record.id} → ${saved.id}`);
       return { ...record, status: 'pending', serverId: saved.id };
     } catch {
       // Fall through to the local queue so the contribution is not lost.
+      devNote(`place ${record.id} kept on device; will retry on next launch`);
       record.status = 'local';
     }
   }
@@ -302,6 +348,7 @@ export async function submitPath(path: SavedPath): Promise<SavedPath> {
           })),
         }),
       });
+      devNote(`saved combi ${path.id} → ${saved.id} (${stops.length} stops)`);
       return { ...path, serverId: saved.id, status: 'pending' };
     }
 
@@ -319,9 +366,11 @@ export async function submitPath(path: SavedPath): Promise<SavedPath> {
         durationSeconds: path.durationSeconds,
       }),
     });
+    devNote(`saved path ${path.id} → ${saved.id}`);
     return { ...path, serverId: saved.id, status: 'pending' };
   } catch {
     // Stays local; `syncLocalContributions` retries on the next launch.
+    devNote(`path ${path.id} kept on device; will retry on next launch`);
     return path;
   }
 }

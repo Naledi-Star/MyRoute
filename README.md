@@ -53,6 +53,27 @@ directly to object storage and confirmed so the server can verify the object.
 
 See `../backend/README.md` for the API contract, security model and deployment.
 
+## Backend
+
+The app is a thin client for the API in `backend/`: places, paths, combi routes,
+stops and chat messages are read from and written to the database through it.
+No server URL, no contributions — the app falls back to on-device storage only
+as an offline queue.
+
+The URL comes from `EXPO_PUBLIC_API_URL` in `.env` (see the comments there for
+emulator, device and production values). Restart Metro with a clean cache after
+changing it:
+
+```bash
+npx expo start -c
+```
+
+Start the API first:
+
+```bash
+cd ../backend && npm start      # http://localhost:3000
+```
+
 ## Interactive map
 
 The Explore tab renders a real map with [MapLibre](https://maplibre.org): MapLibre Native

@@ -42,6 +42,7 @@ import {
   simplifyTrack,
   trackWithStops,
   type CapturedFix,
+  type FixSample,
 } from '@/lib/track';
 
 const PROFILE_LABELS: Record<TravelProfile, string> = {
@@ -83,6 +84,48 @@ type PendingStop = {
 /** Accuracy label for a captured stop, e.g. "±6 m". */
 function accuracyLabel(accuracy: number | null): string {
   return accuracy == null ? 'unknown accuracy' : `±${Math.round(accuracy)} m`;
+}
+
+/** Turn a captured reading into a stop the contributor can rename later. */
+function waypointFrom(fix: FixSample, label: string): PathWaypoint {
+  return {
+    id: `stop-${fix.capturedAt}`,
+    label,
+    latitude: fix.latitude,
+    longitude: fix.longitude,
+    accuracy: fix.accuracy,
+    capturedAt: fix.capturedAt,
+  };
+}
+
+/**
+ * The stop list a combi route is saved with, in travel order.
+ *
+ * Where the trip started is a stop in its own right — usually the rank the
+ * combi leaves from — whether or not the contributor stopped to name it, so
+ * naming one stop on the way is enough: the start becomes the first, theirs is
+ * the next. A named stop already sitting on the start *is* that stop, so
+ * nothing is duplicated; and if it is the only stop, the trip's end becomes the
+ * last one so the route still has two ends to plan between.
+ */
+function combiWaypoints(
+  stops: PathWaypoint[],
+  start: FixSample | undefined,
+  end: FixSample | undefined,
+  startLabel: string,
+): PathWaypoint[] {
+  const list = [...stops];
+  const coveredBy = (fix: FixSample) =>
+    list.some((stop) => distanceMetres(stop, fix) < DUPLICATE_STOP_M);
+
+  if (start && !coveredBy(start)) {
+    const rank = startLabel.trim();
+    list.unshift(waypointFrom(start, rank.length > 0 ? rank : 'Start'));
+  }
+  if (list.length < 2 && start && end && !coveredBy(end) && distanceMetres(end, start) >= DUPLICATE_STOP_M) {
+    list.push(waypointFrom(end, 'End'));
+  }
+  return list;
 }
 
 export default function DrawPathScreen() {
@@ -481,8 +524,8 @@ export default function DrawPathScreen() {
       );
       return;
     }
-    if (combiMode && (mode !== 'record' || stops.length < 2)) {
-      setError('A combi route needs at least two named stops, recorded on the ground.');
+    if (combiMode && (mode !== 'record' || stops.length < 1)) {
+      setError('A combi route needs at least one named stop, recorded on the ground.');
       return;
     }
     if (combiMode && !combiName.trim() && !name.trim()) {
@@ -502,7 +545,13 @@ export default function DrawPathScreen() {
         name: name.trim() || `Path ${new Date().toLocaleDateString()}`,
         profile,
         vertices: geometry,
-        waypoints: mode === 'record' ? stops : [],
+        // A combi route always saves with its trip ends, so one named stop on
+        // the ground is a route: the start (the rank) plus what they recorded.
+        waypoints: combiMode
+          ? combiWaypoints(stops, points[0], points[points.length - 1], combiRank)
+          : mode === 'record'
+            ? stops
+            : [],
         source: mode === 'record' ? 'recorded' : 'drawn',
         kind: combiMode ? 'combi' : 'path',
         ...(combiMode
@@ -534,6 +583,7 @@ export default function DrawPathScreen() {
     geometry,
     mode,
     name,
+    points,
     profile,
     recordedMetres,
     recordedSeconds,
