@@ -10,6 +10,7 @@ import type { InteractiveMapProps, MapMarker } from './map-types';
 
 import {
   BOTSWANA_BOUNDS,
+  BOTSWANA_VIEW,
   FALLBACK_MAP_STYLE,
   GABORONE_VIEW,
   MAP_CAMERA_PADDING,
@@ -33,6 +34,13 @@ const TONE_HEX: Record<NonNullable<MapMarker['tone']>, string> = {
   amber: '#E69D3B',
 };
 
+/**
+ * Colour of a path drawn as map data. Paths are the map — a road somebody drove
+ * that the provider does not know yet — so they are drawn in the app's green,
+ * distinct from the blue preview of a route being inspected.
+ */
+const MAP_DATA_PATH_COLOR = '#0B8A57';
+
 function isMapLibreNativeCodePresent(): boolean {
   return hasMapLibreNativeCode(TurboModuleRegistry as TurboModuleLookup);
 }
@@ -43,12 +51,16 @@ export function InteractiveMap({
   bottomInset = 0,
   markers = [],
   route,
+  routes,
   onMarkerPress,
   droppedPin,
   onMapPress,
   userLocation = null,
   followUser = false,
   recenterKey = 0,
+  zoomInKey = 0,
+  zoomOutKey = 0,
+  fitRoute = false,
   style,
 }: InteractiveMapProps) {
   const [mapLibre, setMapLibre] = useState<MapLibreModule | null>(null);
@@ -60,6 +72,9 @@ export function InteractiveMap({
   const framedFocus = useRef<InteractiveMapProps['focus']>('gaborone');
   const framedKey = useRef(0);
   const lastFollow = useRef<[number, number] | null>(null);
+  const zoomLevel = useRef(GABORONE_VIEW.zoom);
+  const zoomKeys = useRef({ in: zoomInKey, out: zoomOutKey });
+  const framedRoute = useRef<string | null>(null);
   const nativeCodePresent = isMapLibreNativeCodePresent();
 
   useEffect(() => {
@@ -123,11 +138,13 @@ export function InteractiveMap({
       return;
     }
     if (focus === 'me') {
+      const zoom = userLocation ? USER_LOCATION_ZOOM : GABORONE_VIEW.zoom;
+      zoomLevel.current = zoom;
       cameraRef.easeTo({
         center: userLocation
           ? [userLocation.longitude, userLocation.latitude]
           : GABORONE_VIEW.center,
-        zoom: userLocation ? USER_LOCATION_ZOOM : GABORONE_VIEW.zoom,
+        zoom,
         padding: MAP_CAMERA_PADDING,
         duration: 900,
         easing: 'fly',
@@ -135,6 +152,7 @@ export function InteractiveMap({
       return;
     }
     if (focus === 'botswana') {
+      zoomLevel.current = BOTSWANA_VIEW.zoom;
       cameraRef.fitBounds(BOTSWANA_BOUNDS, {
         padding: MAP_CAMERA_PADDING,
         duration: 900,
@@ -142,6 +160,7 @@ export function InteractiveMap({
       });
       return;
     }
+    zoomLevel.current = GABORONE_VIEW.zoom;
     cameraRef.easeTo({
       center: GABORONE_VIEW.center,
       zoom: GABORONE_VIEW.zoom,
@@ -194,6 +213,61 @@ export function InteractiveMap({
   }, [followUser, status, userLocation]);
 
 
+  // Map controls: one step in or out, from wherever the camera already is.
+  // The key is compared against the last one acted on, so mounting the map does
+  // not zoom by itself.
+  useEffect(() => {
+    if (zoomInKey === zoomKeys.current.in) {
+      return;
+    }
+    zoomKeys.current.in = zoomInKey;
+    if (!camera.current || status !== 'ready') {
+      return;
+    }
+    zoomLevel.current += 1;
+    camera.current.zoomTo(zoomLevel.current, { duration: 350, easing: 'ease' });
+  }, [zoomInKey, status]);
+
+  useEffect(() => {
+    if (zoomOutKey === zoomKeys.current.out) {
+      return;
+    }
+    zoomKeys.current.out = zoomOutKey;
+    if (!camera.current || status !== 'ready') {
+      return;
+    }
+    zoomLevel.current = Math.max(1, zoomLevel.current - 1);
+    camera.current.zoomTo(zoomLevel.current, { duration: 350, easing: 'ease' });
+  }, [zoomOutKey, status]);
+
+  // Show the whole recorded line once the trip is finished.
+  const routeBounds = fitRoute && route && route.coordinates.length >= 2
+    ? route.coordinates.reduce<[number, number, number, number]>(
+        ([west, south, east, north], [lng, lat]) => [
+          Math.min(west, lng),
+          Math.min(south, lat),
+          Math.max(east, lng),
+          Math.max(north, lat),
+        ],
+        [Infinity, Infinity, -Infinity, -Infinity],
+      )
+    : null;
+
+  useEffect(() => {
+    if (!routeBounds || !camera.current || status !== 'ready') {
+      return;
+    }
+    const key = routeBounds.map((value) => value.toFixed(5)).join(',');
+    if (framedRoute.current === key) {
+      return;
+    }
+    framedRoute.current = key;
+    camera.current.fitBounds(routeBounds, {
+      padding: { top: 120, bottom: bottomInset + 160, left: 40, right: 40 },
+      duration: 700,
+    });
+  }, [bottomInset, routeBounds, status]);
+
   // The streamed vector style, with the inline OSM raster style as the last resort.
   const fallbackStyle = MAP_STYLES[FALLBACK_MAP_STYLE].inline as unknown as StyleSpecification;
   const mapStyle = useFallbackStyle ? fallbackStyle : (MAP_STYLES[styleId].url ?? fallbackStyle);
@@ -228,6 +302,24 @@ export function InteractiveMap({
           type: 'LineString' as const,
           coordinates: route.coordinates,
         },
+      }
+    : null;
+
+  // Map data: every path the community has recorded, drawn together as part of
+  // the map rather than as somebody's preview.
+  const routesShape = routes?.length
+    ? {
+        type: 'FeatureCollection' as const,
+        features: routes
+          .filter((entry) => entry.coordinates.length >= 2)
+          .map((entry) => ({
+            type: 'Feature' as const,
+            properties: { color: entry.color ?? MAP_DATA_PATH_COLOR },
+            geometry: {
+              type: 'LineString' as const,
+              coordinates: entry.coordinates,
+            },
+          })),
       }
     : null;
 
@@ -279,6 +371,21 @@ export function InteractiveMap({
           ref={camera}
         />
 
+        {routesShape && routesShape.features.length > 0 ? (
+          <GeoJSONSource data={routesShape} id="myroute-routes">
+            <Layer
+              id="myroute-routes-lines"
+              layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              paint={{
+                'line-color': ['get', 'color'],
+                'line-width': 3,
+                'line-opacity': 0.85,
+              }}
+              type="line"
+            />
+          </GeoJSONSource>
+        ) : null}
+
         {routeShape ? (
           <GeoJSONSource data={routeShape} id="myroute-route">
             <Layer
@@ -286,8 +393,9 @@ export function InteractiveMap({
               layout={{ 'line-cap': 'round', 'line-join': 'round' }}
               paint={{
                 'line-color': route?.color ?? '#2779E8',
-                'line-width': 5,
+                'line-width': route?.dashed ? 4 : 5,
                 'line-opacity': 0.9,
+                ...(route?.dashed ? { 'line-dasharray': [1.2, 1.6] } : {}),
               }}
               type="line"
             />

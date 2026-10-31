@@ -1,12 +1,14 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { API_BASE, hasBackend } from './api';
+import { deviceId } from './device';
 
 import { profile } from '@/data/myroute';
 
 const THREADS_KEY = 'myroute:chat-threads';
 const MESSAGES_KEY = 'myroute:chat-messages';
-const DEVICE_KEY = 'myroute:device-id';
+
+export { deviceId };
 
 export type ChatKind = 'community' | 'direct';
 
@@ -55,17 +57,6 @@ async function write(key: string, value: unknown): Promise<void> {
   } catch {
     // Best effort: a full disk should not break the composer.
   }
-}
-
-/** Stable per-install id, so "my" messages stay recognisable across app restarts. */
-export async function deviceId(): Promise<string> {
-  const stored = await read<string | null>(DEVICE_KEY, null);
-  if (stored) {
-    return stored;
-  }
-  const id = makeId('device');
-  await write(DEVICE_KEY, id);
-  return id;
 }
 
 // ── Threads ──────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import { Icon } from '@/components/myroute/icon';
 import { InteractiveMap } from '@/components/myroute/interactive-map';
 import type { MapMarker, MapRoute } from '@/components/myroute/map-types';
 import {
+  BareIconButton,
   IconBadge,
   PrimaryButton,
   RoundButton,
@@ -27,10 +28,11 @@ import {
   type CombiItinerary,
   type CombiRoute,
 } from '@/lib/combi';
-import { fetchCommunityPaths } from '@/lib/api';
+import { deletePathRemote, fetchCommunityPaths } from '@/lib/api';
+import { deviceId } from '@/lib/device';
 import { formatDistance } from '@/lib/geo';
 import { useDeviceLocation } from '@/lib/location';
-import { loadPaths } from '@/lib/paths';
+import { loadPaths, type SavedPath } from '@/lib/paths';
 
 /** "P13" / "P9.50" — pula has no need for trailing zeroes here. */
 function formatFare(value: number | null): string {
@@ -64,8 +66,11 @@ export default function CombiScreen() {
 
   const { coords } = useDeviceLocation({ auto: true });
   const [routes, setRoutes] = useState<CombiRoute[] | null>(null);
+  const [savedRoutes, setSavedRoutes] = useState<SavedPath[]>([]);
   const [query, setQuery] = useState('');
   const [openRouteId, setOpenRouteId] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [selected, setSelected] = useState(0);
   const [sheetHeight, setSheetHeight] = useState(320);
 
@@ -75,14 +80,23 @@ export default function CombiScreen() {
   // every focus so a route recorded a moment ago is here when you come back.
   const reload = useCallback(() => {
     let cancelled = false;
-    void Promise.all([loadPaths(), fetchCommunityPaths()])
+    void Promise.all([loadPaths(), deviceId().then((id) => fetchCommunityPaths(id))])
       .then(([local, community]) => {
         if (cancelled) {
           return;
         }
         const byId = new Map(community.map((path) => [path.id, path]));
-        local.forEach((path) => byId.set(path.id, path));
-        setRoutes(combiRoutesFromPaths([...byId.values()]));
+        // Local copies fill in anything recorded before the upload landed; the
+        // server copy wins where both exist.
+        local.forEach((path) => {
+          if (!byId.has(path.id)) {
+            byId.set(path.id, path);
+          }
+        });
+        const all = [...byId.values()];
+        setSavedRoutes(all);
+        setRoutes(combiRoutesFromPaths(all));
+        setDeleteError(null);
       })
       .catch(() => {
         // Keep what was already on screen rather than clearing it.
@@ -130,15 +144,43 @@ export default function CombiScreen() {
     return pins;
   }, [filtered, openRoute]);
 
+  // Tapping a route shows its actual recorded road as a dotted line. Falling
+  // back to straight lines between stops is honest about what is known: the
+  // stops are real, the road between them is missing from the record.
   const browseLine = useMemo<MapRoute | undefined>(() => {
     if (!openRoute) {
       return undefined;
     }
-    return {
-      coordinates: openRoute.stops.map((stop) => [stop.longitude, stop.latitude]),
-      color: Palette.blue,
-    };
+    const coordinates =
+      openRoute.geometry && openRoute.geometry.length >= 2
+        ? openRoute.geometry
+        : openRoute.stops.map((stop) => [stop.longitude, stop.latitude] as [number, number]);
+    return { coordinates, color: Palette.blue, dashed: true };
   }, [openRoute]);
+
+  const removeRoute = useCallback(
+    async (route: CombiRoute) => {
+      const saved = savedRoutes.find((path) => path.id === route.id);
+      if (!saved) {
+        setDeleteError('This route is not one of yours, so it cannot be deleted.');
+        setConfirmDelete(null);
+        return;
+      }
+      try {
+        await deletePathRemote(saved);
+        setOpenRouteId(null);
+        setConfirmDelete(null);
+        setDeleteError(null);
+        reload();
+      } catch (err) {
+        setDeleteError(
+          err instanceof Error ? err.message : 'The route could not be deleted.',
+        );
+        setConfirmDelete(null);
+      }
+    },
+    [reload, savedRoutes],
+  );
 
   const active = itineraries[selected] ?? itineraries[0] ?? null;
 
@@ -397,6 +439,7 @@ export default function CombiScreen() {
         <View style={styles.map}>
           <InteractiveMap
             bottomInset={0}
+            fitRoute={openRoute != null}
             focus={coords ? 'me' : 'gaborone'}
             markers={browseMarkers}
             onMarkerPress={openStop}
@@ -457,8 +500,15 @@ export default function CombiScreen() {
           </View>
         ) : null}
 
+        {deleteError ? (
+          <AppText color="red" size={10} style={styles.deleteError}>
+            {deleteError}
+          </AppText>
+        ) : null}
+
         {filtered.map((route) => {
           const open = openRouteId === route.id;
+          const confirming = confirmDelete === route.id;
           return (
             <Tap
               accessibilityLabel={`${route.name}, ${route.stops.length} stops`}
@@ -469,11 +519,35 @@ export default function CombiScreen() {
                 <IconBadge icon="minibus" size={38} tone={open ? 'blue' : 'green'} />
                 <View style={styles.routeCopy}>
                   <AppText variant="name">{route.name}</AppText>
+                  {/* Every route has a first and last boarding point, even when
+                      nobody marked stops in between. */}
+                  <AppText color="green" size={10} weight="semibold">
+                    {route.stops.length >= 2
+                      ? `${route.stops[0].name} → ${route.stops[route.stops.length - 1].name}`
+                      : route.stops[0]?.name ?? route.name}
+                  </AppText>
                   <AppText color="muted" size={11}>
                     {route.rank ? `Leaves from ${route.rank} · ` : ''}
-                    {route.stops.length} stops
+                    {route.stops.length} stop{route.stops.length === 1 ? '' : 's'}
                   </AppText>
+                  {confirming ? (
+                    <AppText color="red" size={10}>
+                      Tap the bin again to delete this route
+                    </AppText>
+                  ) : null}
                 </View>
+                <BareIconButton
+                  accessibilityLabel={`Delete ${route.name}`}
+                  color={confirming ? Palette.red : Palette.muted}
+                  icon="trash"
+                  onPress={() => {
+                    if (confirming) {
+                      void removeRoute(route);
+                    } else {
+                      setConfirmDelete(route.id);
+                    }
+                  }}
+                />
                 <Icon color={open ? Palette.green : Palette.muted} name="chevron" size={17} />
               </View>
 
@@ -591,6 +665,7 @@ const styles = StyleSheet.create({
   },
   routeCardOpen: { borderColor: '#BFE2CB', backgroundColor: '#FBFDFB' },
   routeHeader: { flexDirection: 'row', alignItems: 'center', gap: 11 },
+  deleteError: { marginTop: 10, lineHeight: 14 },
   routeCopy: { flex: 1, gap: 1 },
   stopList: {
     marginTop: 10,

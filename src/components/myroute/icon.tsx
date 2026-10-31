@@ -17,6 +17,7 @@ export type IconName =
   | 'chevron'
   | 'church'
   | 'close'
+  | 'edit'
   | 'compass'
   | 'heart'
   | 'home'
@@ -25,12 +26,14 @@ export type IconName =
   | 'map'
   | 'menu'
   | 'minibus'
+  | 'minus'
   | 'more'
   | 'pin'
   | 'plus'
   | 'request'
   | 'search'
   | 'send'
+  | 'settings'
   | 'share'
   | 'shop'
   | 'trash'
@@ -87,6 +90,12 @@ const paths: Record<IconName, ReactNode> = {
   ),
   check: <Path d="m5 12 4 4L19 6" />,
   chevron: <Path d="m9 18 6-6-6-6" />,
+  edit: (
+    <>
+      <Path d="M12 20h9" />
+      <Path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </>
+  ),
   church: (
     <>
       <Path d="M5 21V9l7-5 7 5v12" />
@@ -138,6 +147,7 @@ const paths: Record<IconName, ReactNode> = {
       <Path d="M4 7h16M4 12h16M4 17h16" />
     </>
   ),
+  minus: <Path d="M5 12h14" />,
   minibus: (
     <>
       {/* A combi: tall boxy body, a long side window band, two wheels. */}
@@ -182,6 +192,12 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   send: <Path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7Z" />,
+  settings: (
+    <>
+      <Circle cx={12} cy={12} r={3} />
+      <Path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" />
+    </>
+  ),
   shop: (
     <>
       <Path d="M4 10v11h16V10M3 4h18l-1 6a3 3 0 0 1-5 1 3 3 0 0 1-6 0 3 3 0 0 1-5-1Z" />

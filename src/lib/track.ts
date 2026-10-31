@@ -1,4 +1,7 @@
-import { distanceMetres, type LatLng } from './geo';
+import { distanceMetres, DUPLICATE_STOP_M, type LatLng } from './geo';
+
+/** Stops closer together than this are the same stop, captured twice. */
+export { DUPLICATE_STOP_M };
 
 /**
  * Track maths for recorded paths.
@@ -71,9 +74,6 @@ export const TRACK_SIMPLIFY_M = 8;
 /** Tolerances used when a track is sent to the routing engine. */
 export const SNAP_SIMPLIFY_M = 15;
 export const SNAP_SIMPLIFY_MAX_POINTS = 100;
-
-/** Stops closer together than this are the same stop, captured twice. */
-export const DUPLICATE_STOP_M = 8;
 
 /** Gate for a captured stop: worse than this and the point is refused. */
 export const STOP_MAX_ACCURACY_M = 50;

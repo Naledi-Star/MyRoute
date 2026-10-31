@@ -17,8 +17,9 @@ import {
   Tap,
 } from '@/components/myroute/ui';
 import { Palette, Radius, Shadows } from '@/constants/theme';
+import { deletePathRemote, fetchMyPaths } from '@/lib/api';
 import { formatDistance } from '@/lib/geo';
-import { loadPaths, removePath, type SavedPath } from '@/lib/paths';
+import { labelledEndpoints, type SavedPath } from '@/lib/paths';
 import { useDeviceLocation } from '@/lib/location';
 import { loadPlaces, unsavePlace, type SavedPlace } from '@/lib/places';
 import { formatDuration } from '@/lib/routing';
@@ -35,6 +36,15 @@ const STATUS_LABEL: Record<SavedPath['status'], string> = {
   approved: 'Approved',
 };
 
+/** "Start → End" (or the names of the first and last stop) for a path row. */
+function endpointLabel(path: SavedPath): string | null {
+  const points = labelledEndpoints(path.coordinates, path.waypoints ?? []);
+  if (points.length < 2) {
+    return null;
+  }
+  return `${points[0].label} → ${points[points.length - 1].label}`;
+}
+
 export default function SavedScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -43,12 +53,16 @@ export default function SavedScreen() {
   const [places, setPlaces] = useState<SavedPlace[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const { coords } = useDeviceLocation({ auto: true });
 
   const reload = useCallback(async () => {
-    const [nextPaths, nextPlaces] = await Promise.all([loadPaths(), loadPlaces()]);
+    // Paths come from the database (the device's own pending uploads included),
+    // not from on-device storage; the local copy is only the offline fallback.
+    const [nextPaths, nextPlaces] = await Promise.all([fetchMyPaths(), loadPlaces()]);
     setPaths(nextPaths);
     setPlaces(nextPlaces);
+    setError(null);
   }, []);
 
   // Reload every time the tab gains focus so a path saved in draw-path appears.
@@ -61,6 +75,11 @@ export default function SavedScreen() {
 
   const selected = paths.find((path) => path.id === selectedId) ?? null;
 
+  // Every path carries a Start and an End — the two points a route actually
+  // needs — plus any stops marked in between. A path recorded without a single
+  // stop gets its first and last coordinate labelled here.
+  const labelPoints = selected ? labelledEndpoints(selected.coordinates, selected.waypoints ?? []) : [];
+
   const markers: MapMarker[] = [
     ...places.map((place, index) => ({
       id: `place-${index}`,
@@ -70,31 +89,40 @@ export default function SavedScreen() {
       tone: 'green' as const,
       kind: 'place' as const,
     })),
-    ...(selected?.coordinates[0]
-      ? [
-          {
-            id: 'path-start',
-            latitude: selected.coordinates[0][1],
-            longitude: selected.coordinates[0][0],
-            label: `${selected.name} start`,
-            tone: 'blue' as const,
-            kind: 'destination' as const,
-          },
-        ]
-      : []),
+    ...labelPoints.map((point) => ({
+      id: point.id,
+      latitude: point.latitude,
+      longitude: point.longitude,
+      label: point.label,
+      tone: (point.label === 'Start' ? 'blue' : 'green') as 'blue' | 'green',
+      kind: 'destination' as const,
+    })),
   ];
 
+  // The route is drawn dotted: it is a preview over the map, not a live
+  // navigation line, so it should read as "this is the path" and stay visually
+  // distinct from the map's own roads.
   const route: MapRoute | undefined = selected
-    ? { coordinates: selected.coordinates, color: Palette.blue }
+    ? { coordinates: selected.coordinates, color: Palette.blue, dashed: true }
     : undefined;
 
   const deletePath = useCallback(
-    async (id: string) => {
-      setPaths(await removePath(id));
-      if (selectedId === id) {
-        setSelectedId(null);
+    async (path: SavedPath) => {
+      try {
+        await deletePathRemote(path);
+        setPaths(await fetchMyPaths());
+        if (selectedId === path.id) {
+          setSelectedId(null);
+        }
+        setConfirmDelete(null);
+        setError(null);
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? `Could not delete on the server: ${err.message}`
+            : 'Could not delete this path.',
+        );
       }
-      setConfirmDelete(null);
     },
     [selectedId],
   );
@@ -120,6 +148,7 @@ export default function SavedScreen() {
         <View style={styles.map}>
           <InteractiveMap
             bottomInset={0}
+            fitRoute={selected != null}
             focus="gaborone"
             markers={markers}
             route={route}
@@ -141,6 +170,12 @@ export default function SavedScreen() {
           </AppText>
         </View>
 
+        {error ? (
+          <AppText color="red" size={10} style={styles.error}>
+            {error}
+          </AppText>
+        ) : null}
+
         {isEmpty ? (
           <View style={styles.empty}>
             <Icon color={Palette.green} name="bookmark" size={26} />
@@ -148,7 +183,8 @@ export default function SavedScreen() {
               Nothing saved yet
             </AppText>
             <AppText color="muted" size={11} style={styles.emptyText}>
-              Save a place from its page, or draw a path to keep it here.
+              Save a place from its page, or draw a path to add a road or direction
+              to the map.
             </AppText>
             <View style={styles.emptyActions}>
               <PrimaryButton
@@ -170,7 +206,11 @@ export default function SavedScreen() {
             {paths.length > 0 ? (
               <View style={styles.section}>
                 <AppText size={12} weight="bold" style={styles.sectionTitle}>
-                  Your paths
+                  Paths
+                </AppText>
+                <AppText color="muted" size={10} style={styles.sectionNote}>
+                  Map data recorded by everyone — each one is on the map for all. Edit
+                  or remove your own from here.
                 </AppText>
                 {paths.map((path) => {
                   const confirming = confirmDelete === path.id;
@@ -191,6 +231,9 @@ export default function SavedScreen() {
                         />
                         <View style={styles.rowCopy}>
                           <AppText variant="name">{path.name}</AppText>
+                          <AppText color="green" size={10} weight="semibold">
+                            {endpointLabel(path) ?? 'Start → End'}
+                          </AppText>
                           <AppText color="muted" variant="small">
                             {formatDistance(path.distanceMetres)} ·{' '}
                             {formatDuration(path.durationSeconds)} · {STATUS_LABEL[path.status]}
@@ -216,7 +259,7 @@ export default function SavedScreen() {
                         icon="trash"
                         onPress={() => {
                           if (confirming) {
-                            void deletePath(path.id);
+                            void deletePath(path);
                           } else {
                             setConfirmDelete(path.id);
                           }
@@ -351,6 +394,8 @@ const styles = StyleSheet.create({
     ...Shadows.card,
   },
   sectionTitle: { paddingVertical: 8 },
+  sectionNote: { paddingBottom: 8, marginTop: -4, lineHeight: 14 },
+  error: { marginTop: 8, lineHeight: 14 },
   row: {
     minHeight: 58,
     flexDirection: 'row',

@@ -1,6 +1,10 @@
+import type { PathWaypoint } from './paths';
 import type { Place } from '@/data/myroute';
 
 export type LatLng = { latitude: number; longitude: number };
+
+/** Two stops this close are the same stop, captured twice. */
+export const DUPLICATE_STOP_M = 8;
 
 /** Haversine distance in metres between two coordinates. */
 export function distanceMetres(a: LatLng, b: LatLng): number {
@@ -52,4 +56,60 @@ export function withDistance(place: Place, from: LatLng): Place {
       distanceMetres(from, { latitude: place.latitude, longitude: place.longitude }),
     ),
   };
+}
+/**
+ * The labelled points every path keeps: a start, an end, and the stops between.
+ *
+ * A route only needs two points — where it begins and where it ends. A path
+ * recorded without a single marked stop still gets its first and last
+ * coordinate labelled from `line` (`[lng, lat]` pairs), which is what gives
+ * every saved path, and every combi route, something to pin on the map and two
+ * boarding points for the database to hold. Stops in the middle are kept as
+ * they are: they are the bonus that turns a bare line into a route with places
+ * on it.
+ *
+ * A stop already sitting on the start or the end *is* that endpoint, so it
+ * keeps its own name and nothing is added twice.
+ */
+export function labelledEndpoints(
+  line: [number, number][],
+  stops: PathWaypoint[] = [],
+): PathWaypoint[] {
+  const list = [...stops];
+  if (line.length === 0) {
+    return list;
+  }
+
+  const start = { latitude: line[0][1], longitude: line[0][0] };
+  const covered = (point: LatLng) =>
+    list.some((stop) => distanceMetres(stop, point) < DUPLICATE_STOP_M);
+
+  if (!covered(start)) {
+    list.unshift({
+      id: 'endpoint-start',
+      label: 'Start',
+      latitude: start.latitude,
+      longitude: start.longitude,
+      accuracy: null,
+      capturedAt: 0,
+    });
+  }
+  // A single point is not a route yet: it has an origin but no end to label.
+  if (line.length < 2) {
+    return list;
+  }
+
+  const end = { latitude: line[line.length - 1][1], longitude: line[line.length - 1][0] };
+  // A loop ends where it began, which would otherwise leave one label.
+  if (!covered(end) || list.length < 2) {
+    list.push({
+      id: 'endpoint-end',
+      label: 'End',
+      latitude: end.latitude,
+      longitude: end.longitude,
+      accuracy: null,
+      capturedAt: 0,
+    });
+  }
+  return list;
 }

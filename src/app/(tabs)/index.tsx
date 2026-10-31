@@ -7,7 +7,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/myroute/icon';
 import { InteractiveMap } from '@/components/myroute/interactive-map';
-import type { MapFocus, MapMarker } from '@/components/myroute/map-types';
+import type { MapFocus, MapMarker, MapRoute } from '@/components/myroute/map-types';
 import { AppText } from '@/components/myroute/text';
 import {
   RoundButton,
@@ -23,7 +23,9 @@ import {
   type MapStyleId,
 } from '@/constants/map';
 import { Palette, Radius, Shadows } from '@/constants/theme';
-import { fetchCommunityPlaces, type CommunityPlace } from '@/lib/api';
+import { fetchCommunityPaths, fetchCommunityPlaces, type CommunityPlace } from '@/lib/api';
+import { deviceId } from '@/lib/device';
+import type { SavedPath } from '@/lib/paths';
 import { useDeviceLocation } from '@/lib/location';
 
 const STYLE_STORAGE_KEY = 'myroute:mapStyle';
@@ -39,7 +41,7 @@ export default function ExploreScreen() {
 
   // The map follows the device: the first GPS fix takes the camera from the
   // reference city view to wherever the user actually is.
-  const { coords, permission, error, start } = useDeviceLocation({ auto: true });
+  const { coords, permission, error, servicesEnabled, enable } = useDeviceLocation({ auto: true });
   useEffect(() => {
     if (coords && !autoLocated.current && mapFocus === 'gaborone') {
       autoLocated.current = true;
@@ -52,9 +54,9 @@ export default function ExploreScreen() {
     setRecenterKey((value) => value + 1);
     if (!coords) {
       // Nothing to centre on yet — ask for (or retry) the location it needs.
-      void start();
+      void enable();
     }
-  }, [coords, start]);
+  }, [coords, enable]);
 
   // Remember the user's chosen style across sessions.
   useEffect(() => {
@@ -84,15 +86,28 @@ export default function ExploreScreen() {
 
   // Pins come from approved community places — the same database every device
   // writes to, so a place added here (or anywhere) shows up for everybody.
+  // Paths come from the same database, but they are map data rather than pins:
+  // a road or direction somebody recorded that no provider has yet.
   const [communityPlaces, setCommunityPlaces] = useState<CommunityPlace[]>([]);
+  const [communityPaths, setCommunityPaths] = useState<SavedPath[]>([]);
   useFocusEffect(
     useCallback(() => {
       let cancelled = false;
-      void fetchCommunityPlaces().then((places) => {
-        if (!cancelled) {
+      void (async () => {
+        try {
+          const [places, paths] = await Promise.all([
+            fetchCommunityPlaces(),
+            deviceId().then((id) => fetchCommunityPaths(id)),
+          ]);
+          if (cancelled) {
+            return;
+          }
           setCommunityPlaces(places);
+          setCommunityPaths(paths);
+        } catch {
+          // Server unreachable: the map keeps whatever it already has.
         }
-      });
+      })();
       return () => {
         cancelled = true;
       };
@@ -112,6 +127,19 @@ export default function ExploreScreen() {
     [communityPlaces],
   );
 
+  // A combi route without a verified road line is a list of stops, not a road,
+  // so it is never drawn as map data — it lives on the Combies tab.
+  const pathLines = useMemo<MapRoute[]>(
+    () =>
+      communityPaths
+        .filter(
+          (path) =>
+            path.coordinates.length >= 2 && (path.kind !== 'combi' || path.snapped),
+        )
+        .map((path) => ({ coordinates: path.coordinates })),
+    [communityPaths],
+  );
+
   return (
     <View style={styles.screen}>
       <InteractiveMap
@@ -129,6 +157,7 @@ export default function ExploreScreen() {
           })
         }
         recenterKey={recenterKey}
+        routes={pathLines}
         styleId={mapStyleId}
         userLocation={coords}
       />
@@ -171,11 +200,14 @@ export default function ExploreScreen() {
           </AppText>
         </Tap>
 
-        {permission === 'denied' || error ? (
+        {!servicesEnabled || permission === 'denied' || error ? (
           <Tap
             accessibilityLabel="Turn on location"
             onPress={() => {
-              void start();
+              // The button used to re-run the same check that had already
+              // failed. Now it takes the user to the switch that is actually
+              // off, then re-reads the device when they come back.
+              void enable();
             }}
             style={styles.locationNotice}>
             <Icon color={Palette.red} name="locate" size={14} />

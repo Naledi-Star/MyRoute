@@ -26,6 +26,8 @@ export type MapMarker = {
 export type MapRoute = {
   coordinates: [number, number][];
   color?: string;
+  /** Draw as a dotted line — used for a saved route being previewed. */
+  dashed?: boolean;
 };
 
 /**
@@ -46,6 +48,12 @@ export type InteractiveMapProps = {
   markers?: MapMarker[];
   /** Optional route line to draw. */
   route?: MapRoute;
+  /**
+   * Several lines at once, drawn as map data (the paths people have recorded).
+   * Kept apart from `route` so a preview never has to be mixed into the layer
+   * that represents the map itself.
+   */
+  routes?: MapRoute[];
   /** Called when a marker is tapped. */
   onMarkerPress?: (marker: MapMarker) => void;
   /** When set, the map drops a pin at this coordinate (form mode). */
@@ -61,6 +69,12 @@ export type InteractiveMapProps = {
   followUser?: boolean;
   /** Bump to re-frame the current focus — backs the "Locate me" buttons. */
   recenterKey?: number;
+  /** Bump to zoom in one step (map control). */
+  zoomInKey?: number;
+  /** Bump to zoom out one step (map control). */
+  zoomOutKey?: number;
+  /** Frame the whole `route` instead of a fixed region, when it is present. */
+  fitRoute?: boolean;
   style?: StyleProp<ViewStyle>;
 };
 

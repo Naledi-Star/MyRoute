@@ -1,5 +1,6 @@
 import * as Location from 'expo-location';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState, Linking, Platform } from 'react-native';
 
 import { GABORONE_VIEW } from '@/constants/map';
 import { meanFix, type CapturedFix, type FixSample } from './track';
@@ -151,8 +152,17 @@ export type DeviceLocation = {
   coords: Coords | null;
   permission: LocationPermissionState;
   error: string | null;
+  /** False when the device has location switched off system-wide. */
+  servicesEnabled: boolean;
   /** Requests permission (if needed) and starts watching the position. */
   start: () => Promise<void>;
+  /**
+   * Re-checks the device after the user may have changed something (returning
+   * from the app's settings, or switching location on from the quick menu).
+   */
+  refresh: () => Promise<void>;
+  /** Opens the settings where location can be turned on, then re-checks. */
+  enable: () => Promise<void>;
   /**
    * Stops the watch. Used when something else takes over the GPS for a while —
    * a path recording, for instance — so the device is not running two
@@ -176,6 +186,7 @@ export function useDeviceLocation({ auto = false }: { auto?: boolean } = {}): De
   const [coords, setCoords] = useState<Coords | null>(null);
   const [permission, setPermission] = useState<LocationPermissionState>('undetermined');
   const [error, setError] = useState<string | null>(null);
+  const [servicesEnabled, setServicesEnabled] = useState(true);
   const subscription = useRef<Location.LocationSubscription | null>(null);
   const starting = useRef(false);
   const hasFix = useRef(false);
@@ -194,8 +205,13 @@ export function useDeviceLocation({ auto = false }: { auto?: boolean } = {}): De
     }
     starting.current = true;
     try {
-      const servicesEnabled = await Location.hasServicesEnabledAsync();
-      if (!servicesEnabled) {
+      // Clear a stale error first: it used to survive the user turning location
+      // on, so the "turned off" card stayed on screen for the rest of the session.
+      setError(null);
+
+      const enabled = await Location.hasServicesEnabledAsync();
+      setServicesEnabled(enabled);
+      if (!enabled) {
         setError('Location services are turned off on this device.');
         return;
       }
@@ -236,6 +252,72 @@ export function useDeviceLocation({ auto = false }: { auto?: boolean } = {}): De
     }
   }, [apply]);
 
+  /**
+   * Re-check the device without prompting.
+   *
+   * Called when the app comes back to the foreground: the common fix for "it
+   * says location is off" is to leave the app, switch location on, and come
+   * back — so that return is exactly when the state must be read again.
+   */
+  const refresh = useCallback(async () => {
+    try {
+      const enabled = await Location.hasServicesEnabledAsync();
+      setServicesEnabled(enabled);
+      if (!enabled) {
+        setError('Location services are turned off on this device.');
+        setPermission((current) => (current === 'granted' ? current : 'denied'));
+        return;
+      }
+
+      const current = await Location.getForegroundPermissionsAsync();
+      if (current.status === 'granted') {
+        setPermission('granted');
+        setError(null);
+        // Only restart a watch this screen asked to keep running. A screen that
+        // stopped the GPS on purpose (a path recording takes over) must not have
+        // it quietly restarted when the app returns from the background.
+        if (auto && subscription.current == null) {
+          await start();
+        }
+        return;
+      }
+      if (current.status === 'undetermined') {
+        await start();
+        return;
+      }
+      setPermission('denied');
+      setError('Location permission was denied. Allow it in Settings to see your exact position.');
+    } catch {
+      // A device that cannot answer the question is treated as unavailable; the
+      // enable action opens settings so the user can check for themselves.
+      setError('Could not read the device location setting.');
+    }
+  }, [auto, start]);
+
+  const enable = useCallback(async () => {
+    try {
+      if (Platform.OS === 'android') {
+        // Opens the system location switch directly on Android.
+        await Linking.sendIntent('android.settings.LOCATION_SOURCE_SETTINGS');
+      } else {
+        await Linking.openSettings();
+      }
+    } catch {
+      await Linking.openSettings().catch(() => {});
+    }
+    await refresh();
+  }, [refresh]);
+
+  // Re-read the setting whenever the user comes back to the app.
+  useEffect(() => {
+    const subscriptionToAppState = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void refresh();
+      }
+    });
+    return () => subscriptionToAppState.remove();
+  }, [refresh]);
+
   useEffect(() => {
     let active = true;
     if (auto) {
@@ -263,7 +345,10 @@ export function useDeviceLocation({ auto = false }: { auto?: boolean } = {}): De
     coords,
     permission,
     error,
+    servicesEnabled,
     start,
+    refresh,
+    enable,
     stop,
     origin: originFrom(coords),
   };

@@ -2,7 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 
 import { savedPathsFromCombiRoutes, type ApiCombiRoute } from './combi';
-import { addPath, loadPaths, type SavedPath } from './paths';
+import { deviceId } from './device';
+import { addPath, loadPaths, mergePaths, removePath, type SavedPath } from './paths';
 import { preparePhotoForUpload } from './photo-upload';
 import type { TravelProfile } from './routing';
 
@@ -135,6 +136,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     devNote(`rejected ${response.status} ${code} ${init.method ?? 'GET'} ${path}`);
     throw new ApiRequestError(response.status, code, message);
   }
+  // Deletes answer 204 with no body; there is nothing to parse.
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return (await response.json()) as T;
 }
 
@@ -227,7 +232,9 @@ function toSavedPath(record: ApiPathRecord): SavedPath | null {
     distanceMetres: Number(record.distanceMetres ?? 0),
     durationSeconds: Number(record.durationSeconds ?? 0),
     createdAt: toMillis(record.createdAt, Date.now()),
-    status: 'approved',
+    // A contributor's own record may still be pending; the API only returns it
+    // to that contributor, so its real status is shown instead of pretending.
+    status: record.status === 'pending' ? 'pending' : 'approved',
     kind: 'path',
     ...(record.source ? { source: record.source } : {}),
   };
@@ -285,6 +292,7 @@ export async function submitPlace(
           area: record.area,
           latitude: record.latitude,
           longitude: record.longitude,
+          contributorId: await deviceId(),
         }),
       });
       devNote(`saved place ${record.id} → ${saved.id}`);
@@ -308,71 +316,80 @@ export async function submitPlace(
  * records with ordered stops, not personal recordings). Either way the local id
  * travels as `clientId`, so a retry replaces rather than duplicates, and the
  * app's own copy keeps its id — only the status and `serverId` change.
+ *
+ * The whole recorded line is sent, snapped or not: a track that has not been
+ * matched to roads is still the road the contributor actually took, and refusing
+ * to upload it was why routes existed on the device but not in the database.
+ * Failures throw, so a screen can tell the contributor the upload did not land
+ * instead of silently claiming success.
  */
 export async function submitPath(path: SavedPath): Promise<SavedPath> {
   if (!hasBackend) {
     return path;
   }
 
-  try {
-    if (path.kind === 'combi') {
-      const stops = (path.waypoints ?? []).filter(
-        (stop) =>
-          typeof stop.label === 'string' &&
-          stop.label.trim().length > 0 &&
-          Number.isFinite(stop.latitude) &&
-          Number.isFinite(stop.longitude),
-      );
-      if (stops.length < 2) {
-        return path;
-      }
+  const contributorId = await deviceId();
+  const line = toLineString(
+    path.coordinates.length >= 2 ? path.coordinates : path.vertices,
+  );
 
-      const saved = await request<ApiCombiRoute>('/combi-routes', {
-        method: 'POST',
-        body: JSON.stringify({
-          clientId: path.id,
-          name: (path.combiName ?? '').trim() || path.name,
-          rank: path.rank ?? '',
-          description: '',
-          // Only a road-following line is sent as route geometry. An unsnapped
-          // GPS track is a stop list plus a track, not a verified road line.
-          geometry: path.snapped ? toLineString(path.coordinates) : undefined,
-          stops: stops.map((stop) => ({
-            clientId: stop.id,
-            label: stop.label.trim(),
-            latitude: stop.latitude,
-            longitude: stop.longitude,
-            fareFromPrevious: stop.fareFromPrevious ?? null,
-            accuracyM: stop.accuracy ?? undefined,
-            capturedAt: new Date(stop.capturedAt).toISOString(),
-          })),
-        }),
-      });
-      devNote(`saved combi ${path.id} → ${saved.id} (${stops.length} stops)`);
-      return { ...path, serverId: saved.id, status: 'pending' };
+  if (path.kind === 'combi') {
+    const stops = (path.waypoints ?? []).filter(
+      (stop) =>
+        typeof stop.label === 'string' &&
+        stop.label.trim().length > 0 &&
+        Number.isFinite(stop.latitude) &&
+        Number.isFinite(stop.longitude),
+    );
+    if (stops.length < 2) {
+      throw new ApiRequestError(
+        400,
+        'combi_route_needs_stops',
+        'A combi route needs two stops: where riders board and where they get off.',
+      );
     }
 
-    const saved = await request<ApiPathRecord>('/paths', {
+    const saved = await request<ApiCombiRoute>('/combi-routes', {
       method: 'POST',
       body: JSON.stringify({
         clientId: path.id,
-        name: path.name,
-        profile: path.profile,
-        source: path.source,
-        vertices: toLineString(path.vertices),
-        coordinates: path.snapped ? toLineString(path.coordinates) : undefined,
-        snapped: path.snapped,
-        distanceMetres: path.distanceMetres,
-        durationSeconds: path.durationSeconds,
+        name: (path.combiName ?? '').trim() || path.name,
+        rank: path.rank ?? '',
+        description: '',
+        geometry: line,
+        contributorId,
+        stops: stops.map((stop) => ({
+          clientId: stop.id,
+          label: stop.label.trim(),
+          latitude: stop.latitude,
+          longitude: stop.longitude,
+          fareFromPrevious: stop.fareFromPrevious ?? null,
+          accuracyM: stop.accuracy ?? undefined,
+          capturedAt: new Date(stop.capturedAt).toISOString(),
+        })),
       }),
     });
-    devNote(`saved path ${path.id} → ${saved.id}`);
+    devNote(`saved combi ${path.id} → ${saved.id} (${stops.length} stops)`);
     return { ...path, serverId: saved.id, status: 'pending' };
-  } catch {
-    // Stays local; `syncLocalContributions` retries on the next launch.
-    devNote(`path ${path.id} kept on device; will retry on next launch`);
-    return path;
   }
+
+  const saved = await request<ApiPathRecord>('/paths', {
+    method: 'POST',
+    body: JSON.stringify({
+      clientId: path.id,
+      name: path.name,
+      profile: path.profile,
+      source: path.source,
+      vertices: toLineString(path.vertices),
+      coordinates: line,
+      snapped: path.snapped,
+      distanceMetres: path.distanceMetres,
+      durationSeconds: path.durationSeconds,
+      contributorId,
+    }),
+  });
+  devNote(`saved path ${path.id} → ${saved.id}`);
+  return { ...path, serverId: saved.id, status: 'pending' };
 }
 
 /** Approved places contributed by the community. */
@@ -389,22 +406,28 @@ export async function fetchCommunityPlaces(): Promise<CommunityPlace[]> {
 }
 
 /**
- * Approved paths and combi routes contributed by the community.
+ * Paths and combi routes from the server.
  *
  * Two endpoints, merged locally: `/paths` holds recordings, `/combi-routes`
  * holds routes with ordered stops. A combi route is adapted into the app's
  * `SavedPath` shape (stops as waypoints) so the combi screen and planner keep
  * working unchanged.
+ *
+ * With `contributorId` the listing also includes that device's own pending
+ * contributions, which is how a route appears in Saved and Combies immediately
+ * after it is uploaded instead of waiting for review.
  */
-export async function fetchCommunityPaths(): Promise<SavedPath[]> {
-  if (!hasBackend) {
-    return [];
-  }
-
+async function fetchPaths(query: string): Promise<SavedPath[]> {
   const [paths, combiRoutes] = await Promise.allSettled([
-    request<ApiList<ApiPathRecord>>('/paths?limit=100'),
-    request<ApiList<ApiCombiRoute>>('/combi-routes?limit=100'),
+    request<ApiList<ApiPathRecord>>(`/paths?${query}`),
+    request<ApiList<ApiCombiRoute>>(`/combi-routes?${query}`),
   ]);
+
+  // Both endpoints failing means the server is unreachable, not that the
+  // database is empty — the caller decides whether to fall back to the device.
+  if (paths.status === 'rejected' && combiRoutes.status === 'rejected') {
+    throw paths.reason;
+  }
 
   const merged: SavedPath[] = [];
   if (paths.status === 'fulfilled' && Array.isArray(paths.value.data)) {
@@ -419,6 +442,69 @@ export async function fetchCommunityPaths(): Promise<SavedPath[]> {
     merged.push(...savedPathsFromCombiRoutes(combiRoutes.value.data));
   }
   return merged;
+}
+
+export async function fetchCommunityPaths(contributorId?: string): Promise<SavedPath[]> {
+  if (!hasBackend) {
+    return [];
+  }
+  const mine = contributorId ? `&contributorId=${encodeURIComponent(contributorId)}` : '';
+  return fetchPaths(`limit=100${mine}`);
+}
+
+/**
+ * Everything this device has contributed, pending or approved.
+ *
+ * The server is the source of truth for paths: a recording or drawn line lives
+ * in the database, and this is the read that fills Saved. The results are merged
+ * into the on-device cache so offline previews still work.
+ */
+export async function fetchMyPaths(): Promise<SavedPath[]> {
+  if (!hasBackend) {
+    return loadPaths();
+  }
+  try {
+    const contributorId = await deviceId();
+    const paths = await fetchPaths(
+      `limit=100&mine=1&contributorId=${encodeURIComponent(contributorId)}`,
+    );
+    if (paths.length > 0) {
+      await mergePaths(paths);
+    }
+    // Anything recorded while the upload could not land has no server id yet;
+    // it still belongs on Saved so it is not lost while it waits to be retried.
+    const localOnly = (await loadPaths()).filter((path) => !path.serverId);
+    const byId = new Map(paths.map((path) => [path.id, path]));
+    localOnly.forEach((path) => {
+      if (!byId.has(path.id)) {
+        byId.set(path.id, path);
+      }
+    });
+    return [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+  } catch {
+    // Offline: show what this device already has.
+    return loadPaths();
+  }
+}
+
+/**
+ * Delete one of this device's contributions from the database.
+ *
+ * A local-only record has no server id and is simply removed from the device.
+ * A server failure is re-thrown: the screen keeps the row and tells the
+ * contributor, rather than making the list lie about the database.
+ */
+export async function deletePathRemote(path: SavedPath): Promise<void> {
+  if (hasBackend && path.serverId) {
+    const contributorId = await deviceId();
+    const collection = path.kind === 'combi' ? 'combi-routes' : 'paths';
+    await request<null>(
+      `/${collection}/${path.serverId}?contributorId=${encodeURIComponent(contributorId)}`,
+      { method: 'DELETE' },
+    );
+    devNote(`deleted ${collection} ${path.serverId}`);
+  }
+  await removePath(path.id);
 }
 
 /**
@@ -470,10 +556,15 @@ export async function syncLocalContributions(): Promise<{ places: number; paths:
   try {
     const local = (await loadPaths()).filter((path) => path.status === 'local');
     for (const path of local) {
-      const synced = await submitPath(path);
-      if (synced.serverId) {
-        await addPath(synced);
-        paths += 1;
+      try {
+        const synced = await submitPath(path);
+        if (synced.serverId) {
+          await addPath(synced);
+          paths += 1;
+        }
+      } catch {
+        // One bad record (a legacy combi route with too few stops, say) must
+        // not stop the rest of the queue from being retried.
       }
     }
   } catch {

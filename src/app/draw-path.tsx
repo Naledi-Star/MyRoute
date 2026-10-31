@@ -1,8 +1,8 @@
-import { Image } from 'expo-image';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   KeyboardAvoidingView,
+  Modal,
   Platform,
   ScrollView,
   StyleSheet,
@@ -12,11 +12,13 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { Icon } from '@/components/myroute/icon';
+import { Icon, type IconName } from '@/components/myroute/icon';
 import { InteractiveMap } from '@/components/myroute/interactive-map';
 import type { MapMarker, MapRoute } from '@/components/myroute/map-types';
 import { AppText } from '@/components/myroute/text';
 import {
+  BareIconButton,
+  IconBadge,
   PrimaryButton,
   RoundButton,
   SecondaryButton,
@@ -28,65 +30,82 @@ import {
 } from '@/components/myroute/ui';
 import { DEFAULT_MAP_STYLE } from '@/constants/map';
 import { Palette, Radius, Shadows } from '@/constants/theme';
+import { addPath, labelledEndpoints, loadPaths, snapVertices, type PathWaypoint, type SavedPath } from '@/lib/paths';
 import { submitPath } from '@/lib/api';
 import { distanceMetres, formatDistance } from '@/lib/geo';
 import { useDeviceLocation } from '@/lib/location';
-import { addPath, loadPaths, snapVertices, type PathWaypoint, type SavedPath } from '@/lib/paths';
 import { usePathRecorder } from '@/lib/recording';
 import { formatDuration, type TravelProfile } from '@/lib/routing';
-import { addStopPhoto } from '@/lib/stop-photos';
 import {
   DUPLICATE_STOP_M,
   SNAP_SIMPLIFY_M,
   STOP_GOOD_ACCURACY_M,
   simplifyTrack,
+  trackDistanceMetres,
   trackWithStops,
-  type CapturedFix,
   type FixSample,
 } from '@/lib/track';
 
-const PROFILE_LABELS: Record<TravelProfile, string> = {
-  car: 'Car',
-  bike: 'Bike',
-  foot: 'Walk',
-};
-
-const PROFILE_ORDER: TravelProfile[] = ['car', 'bike', 'foot'];
-
-const MODE_LABELS: Record<CaptureMode, string> = {
-  record: 'Record',
-  draw: 'Draw',
-};
-
-const MODE_ORDER: CaptureMode[] = ['record', 'draw'];
-
 /**
- * How a path is built:
- * - `record` — the phone traces the road while the contributor travels it, and
- *   stops are captured on the ground with their real coordinates.
- * - `draw` — the original flow, tapping the map to place points by hand.
+ * Record a path, in stages.
+ *
+ * The old screen put every configuration option — travel mode, snapping, the
+ * name, combi settings and Save — on the same sheet as the record button. This
+ * version shows one job at a time:
+ *
+ *   1. idle      — map plus Record/Draw, Start recording, Mark a stop
+ *   2. travel    — "How are you travelling?" sheet, before GPS starts
+ *   3. recording — live map, timer, distance, Finish and Mark a stop
+ *   4. finished  — the completed route with Save path
+ *   5. save      — name, snap and combi configuration
+ *
+ * The recorder, GPS watch, distance/duration maths and stop capture are the
+ * existing implementations; this is a restructuring of the screen around them.
  */
+
+type Stage = 'idle' | 'travel' | 'recording' | 'finished';
 type CaptureMode = 'record' | 'draw';
 
-/**
- * A captured position waiting to be named. The stop is not stored until the
- * contributor either names it or accepts the suggested name, so a mistyped or
- * unwanted capture can be thrown away instead of polluting the path.
- */
-type PendingStop = {
-  fix: CapturedFix;
-  /** Pre-filled name, e.g. "Start" or "Stop 3". */
-  suggestedLabel: string;
-  /** Set when an existing stop is being renamed or re-photographed. */
-  id: string | null;
+const RECORD: CaptureMode = 'record';
+const DRAW: CaptureMode = 'draw';
+
+type TravelMode = 'car' | 'bike' | 'walk' | 'combi';
+
+type TravelOption = {
+  key: TravelMode;
+  label: string;
+  icon: IconName;
+  /** The routing profile the recorded line is snapped with. */
+  profile: TravelProfile;
 };
 
-/** Accuracy label for a captured stop, e.g. "±6 m". */
+const TRAVEL_OPTIONS: TravelOption[] = [
+  { key: 'car', label: 'Car', icon: 'car', profile: 'car' },
+  { key: 'bike', label: 'Bike', icon: 'bike', profile: 'bike' },
+  { key: 'walk', label: 'Walk', icon: 'walk', profile: 'foot' },
+  { key: 'combi', label: 'Combi', icon: 'minibus', profile: 'car' },
+];
+
+const MAX_NAME_LENGTH = 50;
+
+function travelOption(mode: TravelMode | null): TravelOption | null {
+  return TRAVEL_OPTIONS.find((option) => option.key === mode) ?? null;
+}
+
+/** HH:MM:SS for the recording timer. */
+function formatClock(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${pad(hours)}:${pad(minutes)}:${pad(rest)}`;
+}
+
 function accuracyLabel(accuracy: number | null): string {
   return accuracy == null ? 'unknown accuracy' : `±${Math.round(accuracy)} m`;
 }
 
-/** Turn a captured reading into a stop the contributor can rename later. */
 function waypointFrom(fix: FixSample, label: string): PathWaypoint {
   return {
     id: `stop-${fix.capturedAt}`,
@@ -99,84 +118,174 @@ function waypointFrom(fix: FixSample, label: string): PathWaypoint {
 }
 
 /**
- * The stop list a combi route is saved with, in travel order.
- *
- * Where the trip started is a stop in its own right — usually the rank the
- * combi leaves from — whether or not the contributor stopped to name it, so
- * naming one stop on the way is enough: the start becomes the first, theirs is
- * the next. A named stop already sitting on the start *is* that stop, so
- * nothing is duplicated; and if it is the only stop, the trip's end becomes the
- * last one so the route still has two ends to plan between.
+ * The stops a combi route is saved with. Start and End are filled in by
+ * `labelledEndpoints` at save time, so this only has to describe a capture.
  */
-function combiWaypoints(
-  stops: PathWaypoint[],
-  start: FixSample | undefined,
-  end: FixSample | undefined,
-  startLabel: string,
-): PathWaypoint[] {
-  const list = [...stops];
-  const coveredBy = (fix: FixSample) =>
-    list.some((stop) => distanceMetres(stop, fix) < DUPLICATE_STOP_M);
-
-  if (start && !coveredBy(start)) {
-    const rank = startLabel.trim();
-    list.unshift(waypointFrom(start, rank.length > 0 ? rank : 'Start'));
-  }
-  if (list.length < 2 && start && end && !coveredBy(end) && distanceMetres(end, start) >= DUPLICATE_STOP_M) {
-    list.push(waypointFrom(end, 'End'));
-  }
-  return list;
+/** A row with a label, supporting text and a green switch. */
+function ToggleRow({
+  label,
+  description,
+  value,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  description?: string;
+  value: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Tap
+      accessibilityLabel={label}
+      disabled={disabled}
+      onPress={() => onChange(!value)}
+      style={[styles.toggleRow, disabled && styles.disabled]}>
+      <View style={styles.toggleCopy}>
+        <AppText size={12} weight="bold">
+          {label}
+        </AppText>
+        {description ? (
+          <AppText color="muted" size={10} style={styles.toggleHint}>
+            {description}
+          </AppText>
+        ) : null}
+      </View>
+      <View style={[styles.switch, value && styles.switchOn]}>
+        <View style={[styles.switchKnob, value && styles.switchKnobOn]} />
+      </View>
+    </Tap>
+  );
 }
 
-export default function DrawPathScreen() {
+/** A conventional dropdown: one field, and a vertical list when it opens. */
+function TravelDropdown({
+  value,
+  onChange,
+}: {
+  value: TravelMode | null;
+  onChange: (next: TravelMode) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = travelOption(value);
+
+  return (
+    <View>
+      <Tap
+        accessibilityLabel="Select travel mode"
+        onPress={() => setOpen((current) => !current)}
+        style={[styles.dropdown, open && styles.dropdownOpen]}>
+        <Icon
+          color={selected ? Palette.green : Palette.muted}
+          name={selected?.icon ?? 'compass'}
+          size={20}
+        />
+        <AppText
+          color={selected ? 'ink' : 'muted'}
+          size={13}
+          style={styles.dropdownLabel}
+          weight={selected ? 'semibold' : 'regular'}>
+          {selected?.label ?? 'Select travel mode'}
+        </AppText>
+        <Icon color={Palette.muted} name={open ? 'arrow' : 'chevron'} size={16} />
+      </Tap>
+
+      {open ? (
+        <View style={styles.dropdownList}>
+          {TRAVEL_OPTIONS.map((option) => {
+            const active = option.key === value;
+            return (
+              <Tap
+                accessibilityLabel={option.label}
+                key={option.key}
+                onPress={() => {
+                  onChange(option.key);
+                  setOpen(false);
+                }}
+                style={[styles.dropdownItem, active && styles.dropdownItemActive]}>
+                <Icon
+                  color={active ? Palette.green : Palette.ink}
+                  name={option.icon}
+                  size={19}
+                />
+                <AppText
+                  color={active ? 'green' : 'ink'}
+                  size={13}
+                  style={styles.dropdownLabel}
+                  weight={active ? 'bold' : 'regular'}>
+                  {option.label}
+                </AppText>
+                {active ? <Icon color={Palette.green} name="check" size={16} /> : null}
+              </Tap>
+            );
+          })}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+export default function RecordPathScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const { id: editingId } = useLocalSearchParams<{ id?: string }>();
 
-  const [mode, setMode] = useState<CaptureMode>('record');
-  // Hand-placed points live here; a recorded track lives in the recorder, which
-  // stays the single source of truth for what the device actually saw.
+  const [stage, setStage] = useState<Stage>('idle');
+  const [mode, setMode] = useState<CaptureMode>(RECORD);
   const [drawVertices, setDrawVertices] = useState<[number, number][]>([]);
+  const [travelMode, setTravelMode] = useState<TravelMode | null>(null);
   const [stops, setStops] = useState<PathWaypoint[]>([]);
+  const [capturing, setCapturing] = useState(false);
   const [stopNotice, setStopNotice] = useState<{ tone: 'green' | 'amber' | 'red'; text: string } | null>(
     null,
   );
-  const [capturing, setCapturing] = useState(false);
-  const [pendingStop, setPendingStop] = useState<PendingStop | null>(null);
-  const [stopName, setStopName] = useState('');
-  const [stopPhotoUri, setStopPhotoUri] = useState<string | null>(null);
-  const [stopFare, setStopFare] = useState('');
-  const [addingPhoto, setAddingPhoto] = useState(false);
-  const [combiMode, setCombiMode] = useState(false);
-  const [combiName, setCombiName] = useState('');
-  const [combiRank, setCombiRank] = useState('');
-  const [profile, setProfile] = useState<TravelProfile>('foot');
-  const [snapped, setSnapped] = useState<MapRoute | null>(null);
-  const [snapInfo, setSnapInfo] = useState<{ distanceMetres: number; durationSeconds: number } | null>(
-    null,
-  );
-  const [snapping, setSnapping] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [justAdded, setJustAdded] = useState<PathWaypoint | null>(null);
+  const [viewStops, setViewStops] = useState(false);
+
+  const [sliderOpen, setSliderOpen] = useState<'travel' | 'settings' | 'save' | null>(null);
+  const [travelDraft, setTravelDraft] = useState<TravelMode | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [showStats, setShowStats] = useState(true);
+  const [combiEnabled, setCombiEnabled] = useState(false);
+
   const [name, setName] = useState('');
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
   const [editing, setEditing] = useState<SavedPath | null>(null);
-  const [focusedOnMe, setFocusedOnMe] = useState(false);
+
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [clock, setClock] = useState(0);
+  const [finishedDistance, setFinishedDistance] = useState(0);
+  const [finishedDuration, setFinishedDuration] = useState(0);
+  const [snappedRoute, setSnappedRoute] = useState<{
+    coordinates: [number, number][];
+    distanceMetres: number;
+    durationSeconds: number;
+  } | null>(null);
+
+  const [zoomInKey, setZoomInKey] = useState(0);
+  const [zoomOutKey, setZoomOutKey] = useState(0);
   const [recenterKey, setRecenterKey] = useState(0);
-  const [sheetHeight, setSheetHeight] = useState(300);
+  const [sheetHeight, setSheetHeight] = useState(280);
+  const [error, setError] = useState<string | null>(null);
 
   const recorder = usePathRecorder();
-  const { height: windowHeight } = useWindowDimensions();
-  const {
-    recording,
-    points,
-    distanceMetres: recordedMetres,
-    durationSeconds: recordedSeconds,
-    loadVertices,
-  } = recorder;
+  const { recording, points, distanceMetres: recordedMetres } = recorder;
 
-  // The map's own dot. While recording, the recorder already has a high-accuracy
-  // watch running, so this one is paused rather than run alongside it.
-  const { coords, start: startLocation, stop: stopLocation } = useDeviceLocation({ auto: false });
+  // The map's own fix. While recording the recorder has a high-accuracy watch
+  // of its own, so this one is paused rather than run alongside it.
+  const {
+    coords,
+    start: startLocation,
+    stop: stopLocation,
+    enable: enableLocation,
+    error: locationError,
+  } = useDeviceLocation({ auto: false });
+
   useEffect(() => {
     if (recording) {
       stopLocation();
@@ -185,7 +294,7 @@ export default function DrawPathScreen() {
     void startLocation();
   }, [recording, startLocation, stopLocation]);
 
-  // Opened from the Saved tab: load that path so it can be edited and re-snapped.
+  // Load a saved path when opened from Saved so it can be edited and re-saved.
   useEffect(() => {
     if (!editingId) {
       return;
@@ -197,148 +306,214 @@ export default function DrawPathScreen() {
         return;
       }
       setEditing(existing);
-      setMode(existing.source === 'recorded' ? 'record' : 'draw');
-      if (existing.source === 'recorded') {
-        loadVertices(existing.vertices, {
-          startedAt: existing.createdAt,
-          durationSeconds: existing.durationSeconds,
-        });
-      } else {
-        setDrawVertices(existing.vertices);
-      }
-      setStops(existing.waypoints ?? []);
-      setProfile(existing.profile);
       setName(existing.name);
-      setSnapped(
-        existing.snapped ? { coordinates: existing.coordinates, color: Palette.blue } : null,
-      );
-      setSnapInfo(
-        existing.distanceMetres || existing.durationSeconds
+      setStops(existing.waypoints ?? []);
+      setSnappedRoute(
+        existing.snapped
           ? {
+              coordinates: existing.coordinates,
               distanceMetres: existing.distanceMetres,
               durationSeconds: existing.durationSeconds,
             }
           : null,
       );
+      setFinishedDistance(existing.distanceMetres);
+      setFinishedDuration(existing.durationSeconds);
+      if (existing.source === 'recorded') {
+        recorder.loadVertices(existing.vertices, {
+          startedAt: existing.createdAt,
+          durationSeconds: existing.durationSeconds,
+        });
+        setMode(RECORD);
+        setStage('finished');
+      } else {
+        setDrawVertices(existing.vertices);
+        setMode(DRAW);
+        setStage('idle');
+      }
+      const option =
+        existing.profile === 'car' ? 'car' : existing.profile === 'bike' ? 'bike' : 'walk';
+      setTravelMode(existing.kind === 'combi' ? 'combi' : option);
+      setCombiEnabled(existing.kind === 'combi');
     })();
     return () => {
       cancelled = true;
     };
-    // Deliberately keyed on the id and the stable loader only: re-running this
-    // on every recorded point would reload the path mid-recording.
-  }, [editingId, loadVertices]);
+    // Keyed on the id and the stable loader: re-running on every recorded point
+    // would reload the path mid-recording.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingId, recorder.loadVertices]);
 
-  /**
-   * The line this screen will save.
-   *
-   * The recorded track already contains every captured stop (the recorder
-   * inserts them by time), and every stop is merged in anyway: the coordinates
-   * collected on the way are the road, the stops are the named points on it, and
-   * neither may be lost because the other happened to exist. A trip with few
-   * watch readings and two marked stops is still a complete path.
-   */
+  // Live timer. The recorder derives duration from the fixes it has, which can
+  // stand still between readings; this ticks every second so the screen shows
+  // the journey's real elapsed time.
+  useEffect(() => {
+    if (stage !== 'recording' || startedAt == null) {
+      return;
+    }
+    const tick = () => setClock(Math.floor((Date.now() - startedAt) / 1000));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [stage, startedAt]);
+
+  // The stop confirmation is a moment, not a mode: clear it on its own so the
+  // recording screen returns to the journey without the contributor tapping.
+  useEffect(() => {
+    if (!justAdded) {
+      return;
+    }
+    const timer = setTimeout(() => setJustAdded(null), 6000);
+    return () => clearTimeout(timer);
+  }, [justAdded]);
+
+  useFocusEffect(
+    useCallback(() => {
+      setError(null);
+    }, []),
+  );
+
   const geometry = useMemo<[number, number][]>(() => {
-    if (mode === 'draw') {
+    if (mode === DRAW && stage === 'idle') {
       return drawVertices;
     }
     return trackWithStops(recorder.points, stops).map(
       (point) => [point.longitude, point.latitude] as [number, number],
     );
-  }, [drawVertices, mode, recorder.points, stops]);
+  }, [drawVertices, mode, recorder.points, stage, stops]);
 
-  const shownError = error ?? recorder.error;
+  const drawnMetres = useMemo(
+    () =>
+      trackDistanceMetres(
+        drawVertices.map(([longitude, latitude]) => ({ latitude, longitude })),
+      ),
+    [drawVertices],
+  );
 
-  const resetResult = useCallback(() => {
-    setSnapped(null);
-    setSnapInfo(null);
-    setStopNotice(null);
+  const liveMetres = mode === DRAW ? drawnMetres : recordedMetres;
+  const elapsed = Math.max(clock, Math.round(recorder.durationSeconds));
+
+  const lastPoint = points[points.length - 1];
+  const liveLocation = recording && lastPoint ? lastPoint : coords;
+
+  const preview = useMemo<MapRoute | undefined>(() => {
+    if (stage === 'finished' && snappedRoute) {
+      return { coordinates: snappedRoute.coordinates, color: Palette.green };
+    }
+    if (geometry.length < 2) {
+      return undefined;
+    }
+    return { coordinates: geometry, color: Palette.green };
+  }, [geometry, snappedRoute, stage]);
+
+  /**
+   * The points this route is labelled with: Start, End, and every stop between
+   * them. Shown as pins on the map and listed in the save panel, so a path with
+   * no marked stops still shows where it begins and where it ends.
+   */
+  const labelled = useMemo(
+    () => labelledEndpoints(snappedRoute?.coordinates ?? geometry, stops),
+    [geometry, snappedRoute, stops],
+  );
+
+  const markers = useMemo<MapMarker[]>(() => {
+    const pins: MapMarker[] = [];
+    if (mode === DRAW && stage === 'idle') {
+      drawVertices.forEach((coordinate, index) => {
+        pins.push({
+          id: `vertex-${index}`,
+          latitude: coordinate[1],
+          longitude: coordinate[0],
+          label: `${index + 1}`,
+          tone: index === 0 ? 'green' : 'blue',
+          kind: 'destination',
+        });
+      });
+      return pins;
+    }
+
+    return labelled.map((point) => ({
+      id: point.id,
+      latitude: point.latitude,
+      longitude: point.longitude,
+      label: point.label,
+      tone:
+        point.accuracy != null && point.accuracy > STOP_GOOD_ACCURACY_M
+          ? 'amber'
+          : point.label === 'Start'
+            ? 'blue'
+            : 'green',
+      kind: 'destination',
+    }));
+  }, [drawVertices, labelled, mode, stage]);
+
+  const measureSheet = (event: LayoutChangeEvent) => {
+    setSheetHeight(event.nativeEvent.layout.height);
+  };
+
+  const chooseTravel = useCallback((next: TravelMode) => {
+    setTravelMode(next);
+    setTravelDraft(next);
+    if (next === 'combi') {
+      setCombiEnabled(true);
+    }
   }, []);
 
-  const addVertex = useCallback(
-    (point: { latitude: number; longitude: number }) => {
-      resetResult();
-      setError(null);
-      setDrawVertices((current) => [...current, [point.longitude, point.latitude]]);
-    },
-    [resetResult],
-  );
-
-  const clear = useCallback(() => {
-    resetResult();
-    recorder.clear();
-    setDrawVertices([]);
-    setStops([]);
-    setPendingStop(null);
-    setStopPhotoUri(null);
-  }, [recorder, resetResult]);
-
-  const stopRecording = useCallback(() => {
-    recorder.stop();
-    setStopNotice(
-      recorder.points.length > 1
-        ? {
-            tone: 'green',
-            text: `Recording stopped after ${formatDistance(recordedMetres)}. Add any stops you passed, then save below.`,
-          }
-        : null,
-    );
-  }, [recordedMetres, recorder]);
-
-  const undo = useCallback(() => {
-    resetResult();
-    if (pendingStop) {
-      // A capture that has not been named yet is the most recent thing to undo.
-      setPendingStop(null);
-      setStopPhotoUri(null);
-      return;
-    }
-    if (mode === 'draw') {
-      setDrawVertices((current) => current.slice(0, -1));
-      return;
-    }
-    const lastStop = stops[stops.length - 1];
-    const lastPoint = recorder.points[recorder.points.length - 1];
-    if (lastStop && (!lastPoint || lastStop.capturedAt >= lastPoint.capturedAt)) {
-      setStops((current) => current.slice(0, -1));
-      return;
-    }
-    recorder.removeLast();
-  }, [mode, pendingStop, recorder, resetResult, stops]);
-
-  const switchMode = useCallback(
-    (next: CaptureMode) => {
-      if (next === mode) {
+  const startRecording = useCallback(
+    async (chosen?: TravelMode) => {
+      const chosenMode = chosen ?? travelMode;
+      if (!chosenMode) {
         return;
       }
-      // Each mode builds its own line, so switching starts from a clean slate
-      // instead of mixing a recorded track with hand-placed points.
-      recorder.stop();
-      recorder.clear();
-      setDrawVertices([]);
-      setStops([]);
-      setPendingStop(null);
-      setStopPhotoUri(null);
-      setFocusedOnMe(false);
-      resetResult();
+      setTravelMode(chosenMode);
+      if (chosenMode === 'combi') {
+        setCombiEnabled(true);
+      }
+      setSliderOpen(null);
+      setStage('recording');
+      setStartedAt(Date.now());
+      setClock(0);
+      setJustAdded(null);
+      setSnappedRoute(null);
+      setFinishedDistance(0);
+      setFinishedDuration(0);
       setError(null);
-      setMode(next);
+      // The dot on the map is where the contributor is standing, which is where
+      // the trip starts — not wherever the first GPS reading lands.
+      const started = await recorder.start(coords);
+      if (!started) {
+        // No permission or no location service: stay on the first screen, where
+        // the recorder's explanation is visible, instead of pretending to record.
+        setStage('idle');
+        setStartedAt(null);
+      }
     },
-    [mode, recorder, resetResult],
+    [coords, recorder, travelMode],
   );
 
-  const toggleRecording = useCallback(() => {
-    if (recording) {
-      stopRecording();
-      return;
-    }
-    setStopNotice(null);
-    setError(null);
-    // The dot on the map is the position the contributor is standing at, which
-    // is where this trip starts — not wherever the GPS happens to report first.
-    void recorder.start(coords);
-  }, [coords, recorder, recording, stopRecording]);
+  const finishRecording = useCallback(() => {
+    const seconds = startedAt != null ? Math.round((Date.now() - startedAt) / 1000) : 0;
+    setFinishedDistance(recorder.distanceMetres);
+    setFinishedDuration(Math.max(seconds, Math.round(recorder.durationSeconds)));
+    recorder.stop();
+    setJustAdded(null);
+    setStage('finished');
+  }, [recorder, startedAt]);
 
-  const markStop = useCallback(async () => {
+  const addVertex = useCallback((point: { latitude: number; longitude: number }) => {
+    setError(null);
+    setSnappedRoute(null);
+    setDrawVertices((current) => [...current, [point.longitude, point.latitude]]);
+  }, []);
+
+  const clearDraw = useCallback(() => {
+    setDrawVertices([]);
+    setSnappedRoute(null);
+    setError(null);
+  }, []);
+
+  /** Capture where the contributor is standing as a stop on this route. */
+  const captureStop = useCallback(async () => {
     setCapturing(true);
     setStopNotice(null);
     try {
@@ -353,363 +528,260 @@ export default function DrawPathScreen() {
         return;
       }
       if (result.status === 'moving') {
-        setStopNotice({
-          tone: 'amber',
-          text: 'You are still moving — stop, then mark this stop.',
-        });
+        setStopNotice({ tone: 'amber', text: 'You are still moving — stop, then mark this stop.' });
         return;
       }
       if (result.status === 'weak') {
         setStopNotice({
           tone: 'red',
-          text: `Weak fix (${accuracyLabel(fix.accuracy)}) — not saved. Move into the open and try again.`,
+          text: `Weak fix (${accuracyLabel(fix.accuracy)}) — move into the open and try again.`,
         });
         return;
       }
-
-      const previous = stops[stops.length - 1];
-      if (previous && !recording && distanceMetres(previous, fix) < DUPLICATE_STOP_M) {
-        setStopNotice({
-          tone: 'amber',
-          text: `${accuracyLabel(fix.accuracy)} — same place as "${previous.label}", so it was not added.`,
-        });
+      if (stops.some((stop) => distanceMetres(stop, fix) < DUPLICATE_STOP_M)) {
+        setStopNotice({ tone: 'amber', text: 'A stop is already marked here.' });
         return;
       }
 
-      // Hold the fix while it is named: the stop, and the photo that goes with
-      // it, are only stored once the contributor accepts them.
-      const suggestedLabel = stops.length === 0 ? 'Start' : `Stop ${stops.length + 1}`;
-      setPendingStop({ fix, suggestedLabel, id: null });
-      setStopName(suggestedLabel);
-      setStopPhotoUri(null);
-      setStopFare('');
-      setStopNotice({
-        tone: result.status === 'ok' ? 'green' : 'amber',
-        text:
-          result.status === 'ok'
-            ? `${accuracyLabel(fix.accuracy)} — name this stop.`
-            : `Rough fix (${accuracyLabel(fix.accuracy)}) — name it, and expect this point to be loose.`,
-      });
+      const waypoint = waypointFrom(fix, `Stop ${stops.length + 1}`);
+      recorder.addPoint(fix);
+      setStops((current) => [...current, waypoint]);
+      // The line changed, so any previous road match no longer describes it.
+      setSnappedRoute(null);
+      setJustAdded(waypoint);
+      setViewStops(false);
+      setStopNotice(null);
     } finally {
       setCapturing(false);
     }
-  }, [recorder, recording, stops]);
+  }, [recorder, stops]);
 
-  /** Store the stop being named, adding or updating it in place. */
-  const confirmStop = useCallback(() => {
-    const pending = pendingStop;
-    if (!pending) {
-      return;
-    }
-    const label = stopName.trim() || pending.suggestedLabel;
-    const parsedFare = stopFare.trim().length > 0 ? Number(stopFare.replace(',', '.')) : null;
-    const fare = parsedFare != null && Number.isFinite(parsedFare) && parsedFare >= 0 ? parsedFare : null;
-    const waypoint: PathWaypoint = {
-      id: pending.id ?? `stop-${pending.fix.capturedAt}`,
-      label,
-      latitude: pending.fix.latitude,
-      longitude: pending.fix.longitude,
-      accuracy: pending.fix.accuracy,
-      capturedAt: pending.fix.capturedAt,
-      ...(stopPhotoUri ? { photoUri: stopPhotoUri } : {}),
-      ...(combiMode && fare != null ? { fareFromPrevious: fare } : {}),
-    };
-
-    // Every captured stop is a point on the line, recording or not: that is what
-    // makes "start, stop, stop, save" a complete path even if the watch was
-    // sparse between the stops.
-    if (!pending.id) {
-      recorder.addPoint(pending.fix);
-    }
-
-    setStops((current) =>
-      pending.id
-        ? current.map((stop) => (stop.id === pending.id ? waypoint : stop))
-        : [...current, waypoint],
-    );
-    setPendingStop(null);
-    setStopPhotoUri(null);
-    resetResult();
-    setStopNotice({
-      tone: 'green',
-      text: `${label} saved at ${accuracyLabel(pending.fix.accuracy)}${
-        waypoint.photoUri ? ' with a photo' : ''
-      }.`,
-    });
-  }, [combiMode, pendingStop, recorder, resetResult, stopFare, stopName, stopPhotoUri]);
-
-  const discardStop = useCallback(() => {
-    setPendingStop(null);
-    setStopPhotoUri(null);
-    setStopNotice(null);
-  }, []);
-
-  /** Rename a stored stop, or add a photo to it. */
-  const editStop = useCallback((stop: PathWaypoint) => {
-    setPendingStop({
-      fix: {
-        latitude: stop.latitude,
-        longitude: stop.longitude,
-        accuracy: stop.accuracy,
-        capturedAt: stop.capturedAt,
-        samples: 0,
-        spreadMetres: 0,
-      },
-      suggestedLabel: stop.label,
-      id: stop.id,
-    });
-    setStopName(stop.label);
-    setStopPhotoUri(stop.photoUri ?? null);
-    setStopFare(stop.fareFromPrevious != null ? String(stop.fareFromPrevious) : '');
-    setStopNotice(null);
-  }, []);
-
-  const chooseStopPhoto = useCallback(
-    async (source: 'camera' | 'library') => {
-      const pending = pendingStop;
-      if (!pending) {
+  const switchMode = useCallback(
+    (next: CaptureMode) => {
+      if (next === mode || stage !== 'idle') {
         return;
       }
-      setAddingPhoto(true);
-      try {
-        const outcome = await addStopPhoto(
-          source,
-          pending.id ?? `stop-${pending.fix.capturedAt}`,
-        );
-        if (outcome.status === 'saved') {
-          setStopPhotoUri(outcome.uri);
-          setStopNotice(null);
-        } else if (outcome.status === 'failed') {
-          setStopNotice({ tone: 'red', text: outcome.message });
-        }
-      } finally {
-        setAddingPhoto(false);
-      }
+      setMode(next);
+      setSnappedRoute(null);
+      setStopNotice(null);
+      setError(null);
     },
-    [pendingStop],
+    [mode, stage],
   );
 
-  const snap = useCallback(async () => {
-    if (geometry.length < 2) {
-      setError('Add at least two points before snapping.');
+  /** Snap the current line to roads for the save configuration. */
+  const snapLine = useCallback(async () => {
+    const profile = travelOption(travelMode)?.profile ?? 'foot';
+    const source =
+      mode === RECORD && points.length > 2
+        ? simplifyTrack(points, SNAP_SIMPLIFY_M).map(
+            (point) => [point.longitude, point.latitude] as [number, number],
+          )
+        : geometry;
+    return snapVertices(source, profile);
+  }, [geometry, mode, points, travelMode]);
+
+  const savePath = useCallback(async () => {
+    setSaveError(null);
+    const trimmed = name.trim();
+    if (trimmed.length === 0) {
+      setSaveError('Give this path a name.');
       return;
     }
-    setSnapping(true);
-    setError(null);
-    try {
-      // A recorded track has far more points than the routing engine accepts in
-      // one request, so it is thinned to its shape first.
-      const source =
-        mode === 'record' && points.length > 2
-          ? simplifyTrack(points, SNAP_SIMPLIFY_M).map(
-              (point) => [point.longitude, point.latitude] as [number, number],
-            )
-          : geometry;
-      const result = await snapVertices(source, profile);
-      setSnapped({ coordinates: result.coordinates, color: Palette.blue });
-      setSnapInfo({ distanceMetres: result.distanceMetres, durationSeconds: result.durationSeconds });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not snap to roads.');
-    } finally {
-      setSnapping(false);
+    if (trimmed.length > MAX_NAME_LENGTH) {
+      setSaveError(`The name must be ${MAX_NAME_LENGTH} characters or fewer.`);
+      return;
     }
-  }, [geometry, mode, points, profile]);
-
-  const save = useCallback(async () => {
     if (geometry.length < 2) {
-      setError(
-        mode === 'record'
-          ? 'Add one more stop, or record a little further, before saving.'
-          : 'A path needs at least two points.',
+      setSaveError(
+        mode === RECORD
+          ? 'Record a little further, or mark a stop, before saving.'
+          : 'Tap the map at least twice to draw a path.',
       );
       return;
     }
-    if (combiMode && (mode !== 'record' || stops.length < 1)) {
-      setError('A combi route needs at least one named stop, recorded on the ground.');
-      return;
-    }
-    if (combiMode && !combiName.trim() && !name.trim()) {
-      setError('Give the combi route a name, for example Block 8 Route 4.');
-      return;
-    }
+
+    const isCombi = combiEnabled && travelMode === 'combi';
+
     setSaving(true);
     try {
-      const coordinates = snapped?.coordinates ?? geometry;
-      const recordedStats =
-        mode === 'record'
-          ? { distanceMetres: recordedMetres, durationSeconds: recordedSeconds }
-          : { distanceMetres: 0, durationSeconds: 0 };
-      const saved = await addPath({
-        // Keep the same record when editing so the path is updated, not duplicated.
-        ...(editing ? { id: editing.id, createdAt: editing.createdAt, status: editing.status } : {}),
-        name: name.trim() || `Path ${new Date().toLocaleDateString()}`,
-        profile,
-        vertices: geometry,
-        // A combi route always saves with its trip ends, so one named stop on
-        // the ground is a route: the start (the rank) plus what they recorded.
-        waypoints: combiMode
-          ? combiWaypoints(stops, points[0], points[points.length - 1], combiRank)
-          : mode === 'record'
-            ? stops
-            : [],
-        source: mode === 'record' ? 'recorded' : 'drawn',
-        kind: combiMode ? 'combi' : 'path',
-        ...(combiMode
-          ? { combiName: combiName.trim() || name.trim(), rank: combiRank.trim() }
-          : {}),
-        coordinates,
-        snapped: snapped != null,
-        distanceMetres: snapInfo?.distanceMetres ?? recordedStats.distanceMetres,
-        durationSeconds: snapInfo?.durationSeconds ?? recordedStats.durationSeconds,
-      });
-      const created = saved[0];
-      if (created) {
-        const synced = await submitPath(created);
-        if (synced !== created) {
-          await addPath(synced);
+      // Snap only when asked, and treat a routing failure as a reason to keep
+      // the recorded line — not as a reason to lose the path.
+      let snapped = snappedRoute;
+      if (snapEnabled && snapped == null) {
+        try {
+          snapped = await snapLine();
+        } catch {
+          snapped = null;
         }
       }
-      router.navigate('/saved');
+
+      const coordinates = snapped?.coordinates ?? geometry;
+      // Every path keeps a Start and an End — and every stop in between — even
+      // when nobody marked anything: A and B are the route, the stops are the
+      // detail on top of it. A blanked name is dropped so the endpoint can be
+      // regenerated rather than uploaded empty.
+      const waypoints = labelledEndpoints(
+        coordinates,
+        stops.filter((stop) => stop.label.trim().length > 0),
+      );
+      const measured =
+        mode === RECORD
+          ? { distanceMetres: finishedDistance || liveMetres, durationSeconds: finishedDuration }
+          : {
+              distanceMetres: snapped?.distanceMetres ?? drawnMetres,
+              durationSeconds: snapped?.durationSeconds ?? 0,
+            };
+
+      const path = await addPath({
+        ...(editing ? { id: editing.id, createdAt: editing.createdAt, status: editing.status } : {}),
+        name: trimmed,
+        profile: travelOption(travelMode)?.profile ?? 'foot',
+        vertices: geometry,
+        waypoints,
+        source: mode === RECORD ? 'recorded' : 'drawn',
+        kind: isCombi ? 'combi' : 'path',
+        ...(isCombi ? { combiName: trimmed, rank: waypoints[0]?.label ?? '' } : {}),
+        coordinates,
+        snapped: snapped != null,
+        distanceMetres: measured.distanceMetres,
+        durationSeconds: measured.durationSeconds,
+      });
+
+      const created = path[0];
+      if (created) {
+        try {
+          const synced = await submitPath(created);
+          await addPath(synced);
+        } catch (err) {
+          // The path is safe on the device and will be retried on next launch;
+          // say so rather than claiming it reached the database.
+          setSaveError(
+            `Saved on this device, but the database did not receive it yet: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }. It will be retried automatically.`,
+          );
+        }
+      }
+      setSaved(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not save the path.');
+      setSaveError(err instanceof Error ? err.message : 'Could not save the path.');
     } finally {
       setSaving(false);
     }
   }, [
-    combiMode,
-    combiName,
-    combiRank,
+    combiEnabled,
+    drawnMetres,
     editing,
+    finishedDistance,
+    finishedDuration,
     geometry,
+    liveMetres,
     mode,
     name,
-    points,
-    profile,
-    recordedMetres,
-    recordedSeconds,
-    router,
-    snapInfo,
-    snapped,
+    snapEnabled,
+    snapLine,
+    snappedRoute,
     stops,
+    travelMode,
   ]);
 
-  const preview = useMemo<MapRoute | undefined>(() => {
-    if (snapped) {
-      return snapped;
-    }
-    if (geometry.length < 2) {
-      return undefined;
-    }
-    return { coordinates: geometry, color: Palette.green };
-  }, [geometry, snapped]);
+  const title =
+    stage === 'recording'
+      ? 'Recording...'
+      : sliderOpen === 'save' || saved
+        ? 'Save path'
+        : 'Record a path';
 
-  const markers = useMemo<MapMarker[]>(() => {
-    if (mode === 'record') {
-      // One pin per captured stop, not per track point: a recorded line can hold
-      // hundreds of them and the map should stay readable. The place Start was
-      // pressed is a pin of its own, so before any stop has been named the trip
-      // still shows where it began.
-      const pins: MapMarker[] = [];
-      const start = recorder.points[0];
-      const startCoveredByStop =
-        start != null && stops.some((stop) => distanceMetres(stop, start) < DUPLICATE_STOP_M);
-      if (start && !startCoveredByStop) {
-        pins.push({
-          id: 'track-start',
-          latitude: start.latitude,
-          longitude: start.longitude,
-          label: 'Start',
-          tone: 'green',
-          kind: 'destination',
-        });
-      }
-      stops.forEach((stop) => {
-        pins.push({
-          id: stop.id,
-          latitude: stop.latitude,
-          longitude: stop.longitude,
-          label: stop.label,
-          tone:
-            stop.accuracy != null && stop.accuracy > STOP_GOOD_ACCURACY_M
-              ? 'amber'
-              : stop.label === 'Start'
-                ? 'green'
-                : 'blue',
-          kind: 'destination',
-        });
-      });
-      return pins;
+  const back = useCallback(() => {
+    if (sliderOpen != null) {
+      setSliderOpen(null);
+      return;
     }
-    return drawVertices.map((coordinate, index) => ({
-      id: `vertex-${index}`,
-      latitude: coordinate[1],
-      longitude: coordinate[0],
-      label: `${index + 1}`,
-      tone: index === 0 ? 'green' : 'blue',
-      kind: 'destination' as const,
-    }));
-  }, [drawVertices, mode, recorder.points, stops]);
+    if (stage === 'recording') {
+      finishRecording();
+      return;
+    }
+    if (stage === 'finished') {
+      setStage('idle');
+      return;
+    }
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.navigate('/');
+    }
+  }, [finishRecording, router, sliderOpen, stage]);
 
-  // While recording, the freshest position comes from the recorder's own watch.
-  const lastPoint = points[points.length - 1];
-  const liveLocation = recording && lastPoint ? lastPoint : coords;
-
-  const measureSheet = (event: LayoutChangeEvent) => {
-    setSheetHeight(event.nativeEvent.layout.height);
-  };
+  const openSave = useCallback(() => {
+    setSaved(false);
+    setSaveError(null);
+    if (travelMode == null) {
+      setTravelMode('walk');
+    }
+    setSliderOpen('save');
+  }, [travelMode]);
 
   const recentre = useCallback(() => {
-    setFocusedOnMe(true);
     setRecenterKey((value) => value + 1);
     if (!liveLocation) {
-      void startLocation();
+      void enableLocation();
     }
-  }, [liveLocation, startLocation]);
+  }, [enableLocation, liveLocation]);
+
+  const selectedTravel = travelOption(travelMode);
 
   return (
-    <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      style={styles.screen}>
+    <View style={styles.screen}>
       <InteractiveMap
         bottomInset={sheetHeight}
-        focus={mode === 'record' || focusedOnMe ? 'me' : 'gaborone'}
-        followUser={recording}
+        fitRoute={stage === 'finished'}
+        focus="me"
+        followUser={stage === 'recording'}
         markers={markers}
-        onMapPress={mode === 'draw' ? addVertex : undefined}
+        onMapPress={mode === DRAW && stage === 'idle' ? addVertex : undefined}
         recenterKey={recenterKey}
         route={preview}
         styleId={DEFAULT_MAP_STYLE}
         userLocation={liveLocation}
+        zoomInKey={zoomInKey}
+        zoomOutKey={zoomOutKey}
       />
 
       <View style={[styles.header, { paddingTop: insets.top }]}>
         <TopBar
-          onBack={() => (router.canGoBack() ? router.back() : router.navigate('/'))}
-          title={editing ? 'Edit path' : mode === 'record' ? 'Record a path' : 'Draw a path'}
+          action={
+            <BareIconButton
+              accessibilityLabel="Route settings"
+              icon="settings"
+              onPress={() => {
+                setHelpOpen(false);
+                setTravelDraft(travelMode);
+                setSliderOpen('settings');
+              }}
+            />
+          }
+          onBack={back}
+          title={title}
         />
       </View>
 
-      <View style={[styles.actions, { top: insets.top + 70 }]}>
-        <RoundButton
-          accessibilityLabel="Undo last point"
-          icon="back"
-          onPress={undo}
-          style={styles.action}
-        />
-        {recording ? null : (
-          <RoundButton
-            accessibilityLabel="Clear the path"
-            icon="close"
-            onPress={clear}
-            style={styles.action}
-          />
-        )}
+      <View style={[styles.mapActions, { top: insets.top + 82 }]}>
         <RoundButton
           accessibilityLabel="Recentre on my location"
           icon="locate"
           iconColor={Palette.blue}
           onPress={recentre}
-          style={styles.action}
+        />
+        <RoundButton
+          accessibilityLabel="Zoom in"
+          icon="plus"
+          onPress={() => setZoomInKey((value) => value + 1)}
+        />
+        <RoundButton
+          accessibilityLabel="Zoom out"
+          icon="minus"
+          onPress={() => setZoomOutKey((value) => value + 1)}
         />
       </View>
 
@@ -717,202 +789,81 @@ export default function DrawPathScreen() {
         onLayout={measureSheet}
         style={[
           styles.sheet,
-          { maxHeight: Math.round(windowHeight * 0.85), paddingBottom: insets.bottom + 18 },
+          {
+            maxHeight: Math.round(windowHeight * 0.78),
+            paddingBottom: insets.bottom + 16,
+          },
         ]}>
         <SheetHandle />
-        {/* Everything on the sheet scrolls: with the keyboard open the sheet
-            cannot grow past the window, and the field being typed into stays
-            reachable instead of hiding behind the keyboard. */}
+
         <ScrollView
           contentContainerStyle={styles.sheetContent}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}>
 
-        {recording ? null : (
-          <Segmented
-            onChange={(value) => {
-              const next = MODE_ORDER.find((key) => MODE_LABELS[key] === value);
-              if (next) {
-                switchMode(next);
-              }
-            }}
-            options={MODE_ORDER.map((key) => MODE_LABELS[key])}
-            value={MODE_LABELS[mode]}
-          />
-        )}
-
-        {mode === 'record' ? (
+        {/* ── Screen 1 / draw mode ─────────────────────────────────────────── */}
+        {stage === 'idle' ? (
           <>
-            {recording ? (
-              <View style={styles.recordingStrip}>
-                <View style={styles.recordingDot} />
-                <AppText color="blue" size={12} weight="semibold" style={styles.recordingText}>
-                  Recording · {formatDistance(recordedMetres)}
-                  {` · ${stops.length} stop${stops.length === 1 ? '' : 's'}`}
+            <Segmented
+              onChange={(value) =>
+                switchMode(value === 'Draw' ? DRAW : RECORD)
+              }
+              options={['Record', 'Draw']}
+              value={mode === DRAW ? 'Draw' : 'Record'}
+            />
+
+            {mode === RECORD ? (
+              <>
+                <AppText size={17} weight="bold" style={styles.heading}>
+                  Ready to record?
                 </AppText>
-              </View>
+                <AppText color="muted" size={11} style={styles.description}>
+                  Follow your route and MyRoute will trace your journey.
+                </AppText>
+              </>
             ) : (
               <>
-                <AppText size={13} weight="bold" style={styles.modeHeading}>
-                  {points.length > 0
-                    ? `${points.length} points recorded`
-                    : 'Walk it, then save the road you took'}
+                <AppText size={17} weight="bold" style={styles.heading}>
+                  Tap the map to add points
                 </AppText>
-                <AppText color="muted" variant="small" style={styles.hint}>
-                  Start recording to trace where you go, or just mark each stop where you are
-                  standing.
+                <AppText color="muted" size={11} style={styles.description}>
+                  {drawVertices.length === 0
+                    ? 'Start where the path begins, then tap each turn.'
+                    : `${drawVertices.length} point${drawVertices.length === 1 ? '' : 's'} · ${formatDistance(drawnMetres)}`}
                 </AppText>
-
-                {points.length > 0 ? (
-                  <View style={styles.statsRow}>
-                    <Icon color={Palette.green} name="check" size={15} />
-                    <AppText color="green" size={11} weight="semibold">
-                      Recorded · {formatDistance(recordedMetres)}
-                      {recordedSeconds > 0 ? ` · ${formatDuration(recordedSeconds)}` : ''}
-                      {` · ${points.length} point${points.length === 1 ? '' : 's'}`}
-                    </AppText>
-                  </View>
-                ) : null}
               </>
             )}
 
-            {pendingStop ? (
-              <View style={styles.stopCard}>
-                <View style={styles.stopCardHeader}>
-                  <Icon color={Palette.green} name="pin" size={15} />
-                  <AppText size={12} weight="bold" style={styles.stopCardTitle}>
-                    {pendingStop.id ? 'Edit this stop' : 'Name this stop'}
-                  </AppText>
-                  <AppText color="green" size={11} weight="semibold">
-                    {accuracyLabel(pendingStop.fix.accuracy)}
-                  </AppText>
-                </View>
+            <PrimaryButton
+              icon={mode === RECORD ? 'locate' : 'edit'}
+              label={mode === RECORD ? 'Start recording' : 'Save drawn path'}
+              onPress={() => {
+                if (mode === RECORD) {
+                  // A fresh choice every time: Continue stays disabled until the
+                  // contributor says how this trip is being made.
+                  setTravelDraft(null);
+                  setSliderOpen('travel');
+                } else {
+                  openSave();
+                }
+              }}
+              style={styles.primaryAction}
+            />
 
-                <View style={styles.stopNameField}>
-                  <TextField
-                    autoFocus={!pendingStop.id}
-                    onChangeText={setStopName}
-                    placeholder={pendingStop.suggestedLabel}
-                    value={stopName}
-                  />
-                </View>
-
-                {combiMode ? (
-                  <View style={styles.fareRow}>
-                    <AppText color="muted" size={10} style={styles.fareLabel}>
-                      Fare from the previous stop
-                    </AppText>
-                    <View style={styles.fareField}>
-                      <AppText color="muted" size={11} weight="bold">
-                        P
-                      </AppText>
-                      <TextField
-                        keyboardType="decimal-pad"
-                        onChangeText={setStopFare}
-                        placeholder="e.g. 9"
-                        value={stopFare}
-                      />
-                    </View>
-                  </View>
-                ) : null}
-
-                <View style={styles.photoRow}>
-                  {stopPhotoUri ? (
-                    <View style={styles.photoPreview}>
-                      <Image
-                        contentFit="cover"
-                        source={{ uri: stopPhotoUri }}
-                        style={styles.photoThumb}
-                      />
-                      <Tap
-                        accessibilityLabel="Remove the photo"
-                        onPress={() => setStopPhotoUri(null)}
-                        style={styles.photoRemove}>
-                        <Icon color={Palette.surface} name="close" size={12} />
-                      </Tap>
-                    </View>
-                  ) : null}
-                  <SecondaryButton
-                    icon="camera"
-                    label={addingPhoto ? 'Opening…' : stopPhotoUri ? 'Retake' : 'Add photo'}
-                    onPress={() => void chooseStopPhoto('camera')}
-                    small
-                  />
-                  {stopPhotoUri ? null : (
-                    <Tap
-                      accessibilityLabel="Choose a photo from your library"
-                      onPress={() => void chooseStopPhoto('library')}>
-                      <AppText color="green" size={11} weight="semibold">
-                        Library
-                      </AppText>
-                    </Tap>
-                  )}
-                </View>
-
-                <View style={styles.recordActions}>
-                  <PrimaryButton
-                    label="Save stop"
-                    onPress={confirmStop}
-                    style={styles.recordButton}
-                  />
-                  <SecondaryButton
-                    label="Discard"
-                    onPress={discardStop}
-                    style={styles.stopButton}
-                  />
-                </View>
-
-                <AppText color="muted" size={10} style={styles.photoHint}>
-                  {recording
-                    ? 'A photo is optional — recording keeps running while you name this stop.'
-                    : 'A photo is optional — name it and this point joins your path.'}
-                </AppText>
-              </View>
-            ) : recording ? (
-              // While recording, the controls are the two things that matter and
-              // nothing else, so the map keeps the screen.
-              <View style={styles.recordingActions}>
-                <PrimaryButton
-                  icon="pin"
-                  label={capturing ? 'Measuring…' : 'Add stop'}
-                  onPress={() => void markStop()}
-                  style={styles.addStopButton}
-                />
-                <SecondaryButton label="Stop" onPress={toggleRecording} style={styles.stopRecording} />
-              </View>
-            ) : points.length > 1 ? (
-              // Stopped with a track in hand: the job now is naming the stops
-              // that were passed, then saving. Re-recording would throw the
-              // trip away, so it is not offered here — the ✕ clears instead.
-              <View style={styles.recordActions}>
-                <PrimaryButton
-                  icon="pin"
-                  label={capturing ? 'Measuring…' : 'Add stop'}
-                  onPress={() => void markStop()}
-                  style={styles.recordButton}
-                />
-                <SecondaryButton
-                  icon="locate"
-                  label="Keep recording"
-                  onPress={() => void recorder.resume()}
-                  style={styles.stopButton}
-                />
-              </View>
+            {mode === RECORD ? (
+              <SecondaryButton
+                icon="pin"
+                label={capturing ? 'Measuring…' : 'Mark a stop'}
+                onPress={() => void captureStop()}
+                style={styles.secondaryAction}
+              />
             ) : (
-              <View style={styles.recordActions}>
-                <PrimaryButton
-                  icon="locate"
-                  label="Start recording"
-                  onPress={toggleRecording}
-                  style={styles.recordButton}
-                />
-                <SecondaryButton
-                  icon="pin"
-                  label={capturing ? 'Measuring…' : 'Mark a stop'}
-                  onPress={() => void markStop()}
-                  style={styles.stopButton}
-                />
-              </View>
+              <SecondaryButton
+                icon="close"
+                label="Clear points"
+                onPress={clearDraw}
+                style={styles.secondaryAction}
+              />
             )}
 
             {stopNotice ? (
@@ -920,160 +871,518 @@ export default function DrawPathScreen() {
                 {stopNotice.text}
               </AppText>
             ) : null}
+            {error ?? recorder.error ?? locationError ? (
+              <AppText color="muted" size={10} style={styles.notice}>
+                {error ?? recorder.error ?? locationError}
+              </AppText>
+            ) : null}
+            {mode === RECORD && stops.length > 0 ? (
+              <AppText color="green" size={10} style={styles.notice} weight="semibold">
+                {stops.length} stop{stops.length === 1 ? '' : 's'} marked
+              </AppText>
+            ) : null}
+          </>
+        ) : null}
 
-            {!recording && stops.length > 0 ? (
-              <View style={styles.stopList}>
-                {stops.slice(-3).map((stop) => (
-                  <Tap
-                    accessibilityLabel={`Edit ${stop.label}`}
-                    key={stop.id}
-                    onPress={() => editStop(stop)}
-                    style={styles.stopRow}>
-                    {stop.photoUri ? (
-                      <Image
-                        contentFit="cover"
-                        source={{ uri: stop.photoUri }}
-                        style={styles.stopRowThumb}
-                      />
-                    ) : (
-                      <Icon color={Palette.green} name="pin" size={13} />
-                    )}
-                    <AppText numberOfLines={1} size={11} style={styles.stopRowName} weight="semibold">
-                      {stop.label}
+        {/* ── Screen 3: recording in progress ──────────────────────────────── */}
+        {stage === 'recording' ? (
+          <>
+            {showStats ? (
+              <View style={styles.statsRow}>
+                <View style={styles.stat}>
+                  <AppText color="muted" size={10}>
+                    Time
+                  </AppText>
+                  <AppText size={22} weight="bold">
+                    {formatClock(elapsed)}
+                  </AppText>
+                </View>
+                <View style={styles.statDivider} />
+                <View style={styles.stat}>
+                  <AppText color="muted" size={10}>
+                    Distance
+                  </AppText>
+                  <AppText size={22} weight="bold">
+                    {formatDistance(liveMetres)}
+                  </AppText>
+                </View>
+              </View>
+            ) : null}
+
+            {selectedTravel ? (
+              <View style={styles.travelChip}>
+                <Icon color={Palette.green} name={selectedTravel.icon} size={15} />
+                <AppText color="green" size={11} weight="semibold">
+                  {selectedTravel.label}
+                </AppText>
+              </View>
+            ) : null}
+
+            {justAdded ? (
+              <View style={styles.stopCard}>
+                <View style={styles.stopCardTop}>
+                  <View style={styles.successDot}>
+                    <Icon color={Palette.surface} name="check" size={14} />
+                  </View>
+                  <View style={styles.stopCardCopy}>
+                    <AppText size={12} weight="bold">
+                      Stop added!
                     </AppText>
                     <AppText color="muted" size={10}>
-                      {accuracyLabel(stop.accuracy)}
-                      {stop.fareFromPrevious != null ? ` · P${stop.fareFromPrevious}` : ''}
+                      {justAdded.label} · this stop will be included in your route.
                     </AppText>
-                  </Tap>
-                ))}
-                {stops.length > 3 ? (
-                  <AppText color="muted" size={10}>
-                    +{stops.length - 3} earlier stop{stops.length - 3 === 1 ? '' : 's'}
-                  </AppText>
+                  </View>
+                  <BareIconButton
+                    accessibilityLabel="Dismiss stop confirmation"
+                    color={Palette.muted}
+                    icon="close"
+                    onPress={() => setJustAdded(null)}
+                    size={16}
+                  />
+                </View>
+                <SecondaryButton
+                  label={viewStops ? 'Hide stops' : 'View stops'}
+                  onPress={() => setViewStops((current) => !current)}
+                  small
+                />
+                {viewStops ? (
+                  <View style={styles.stopList}>
+                    {stops.map((stop) => (
+                      <View key={stop.id} style={styles.stopRow}>
+                        <Icon color={Palette.green} name="pin" size={12} />
+                        <AppText size={10} style={styles.stopRowName}>
+                          {stop.label}
+                        </AppText>
+                        <AppText color="muted" size={9}>
+                          {accuracyLabel(stop.accuracy)}
+                        </AppText>
+                      </View>
+                    ))}
+                  </View>
                 ) : null}
               </View>
             ) : null}
-          </>
-        ) : (
-          <>
-            <AppText size={13} weight="bold" style={styles.modeHeading}>
-              Tap the map to add points
-            </AppText>
-            <AppText color="muted" variant="small" style={styles.hint}>
-              {drawVertices.length === 0
-                ? 'Start where the path begins, then tap each turn.'
-                : `${drawVertices.length} point${drawVertices.length === 1 ? '' : 's'}${
-                    snapped ? ' · snapped to roads' : ''
-                  }`}
-            </AppText>
-          </>
-        )}
 
-        {shownError ? (
-          <AppText color="red" size={11} style={styles.error}>
-            {shownError}
-          </AppText>
-        ) : null}
-
-        {/* Everything below is the editor: naming, snapping, saving. While
-            recording it stays out of the way. */}
-        {recording ? null : (
-          <>
-        <View style={styles.profileRow}>
-          <Segmented
-            onChange={(value) => {
-              const next = PROFILE_ORDER.find((key) => PROFILE_LABELS[key] === value);
-              if (next) {
-                setProfile(next);
-                setSnapped(null);
-                setSnapInfo(null);
-              }
-            }}
-            options={PROFILE_ORDER.map((key) => PROFILE_LABELS[key])}
-            style={styles.segmented}
-            value={PROFILE_LABELS[profile]}
-          />
-          <SecondaryButton
-            label={snapping ? 'Snapping…' : snapped ? 'Re-snap' : 'Snap to roads'}
-            onPress={() => void snap()}
-            small
-            style={styles.snapButton}
-          />
-        </View>
-
-        {snapInfo ? (
-          <View style={styles.summaryRow}>
-            <Icon color={Palette.green} name="check" size={15} />
-            <AppText color="green" size={11} weight="semibold">
-              {formatDistance(snapInfo.distanceMetres)} · {formatDuration(snapInfo.durationSeconds)}{' '}
-              on {PROFILE_LABELS[profile].toLowerCase()}
-            </AppText>
-          </View>
-        ) : null}
-
-        <View style={styles.nameField}>
-          <TextField
-            onChangeText={setName}
-            placeholder={combiMode ? 'Name this recording' : 'Name this path'}
-            value={name}
-          />
-        </View>
-
-        {mode === 'record' ? (
-          <>
-            <Tap
-              accessibilityLabel="Save as a combi route"
-              onPress={() => setCombiMode((current) => !current)}
-              style={styles.combiToggle}>
-              <View style={[styles.checkbox, combiMode && styles.checkboxOn]}>
-                {combiMode ? <Icon color={Palette.surface} name="check" size={12} /> : null}
-              </View>
-              <View style={styles.combiToggleCopy}>
-                <AppText size={12} weight="bold">
-                  Save as a combi route
-                </AppText>
-                <AppText color="muted" size={10} style={styles.combiToggleHint}>
-                  The named stops become boarding points other people can search, and the track
-                  becomes the road the combi follows.
+            <View style={styles.controls}>
+              <View style={styles.control}>
+                <Tap accessibilityLabel="Finish recording" onPress={finishRecording}>
+                  <View style={styles.finishButton}>
+                    <View style={styles.finishSquare} />
+                  </View>
+                </Tap>
+                <AppText size={11} weight="semibold">
+                  Finish
                 </AppText>
               </View>
-            </Tap>
 
-            {combiMode ? (
-              <>
-                <View style={styles.nameField}>
-                  <TextField
-                    onChangeText={setCombiName}
-                    placeholder="Combi name, e.g. Block 8 Route 4"
-                    value={combiName}
-                  />
-                </View>
-                <View style={styles.nameField}>
-                  <TextField
-                    onChangeText={setCombiRank}
-                    placeholder="Rank it leaves from, e.g. Station"
-                    value={combiRank}
-                  />
-                </View>
-                <AppText color="muted" size={10} style={styles.combiHint}>
-                  Tap a stop above to enter the fare from the previous stop (P9, then P4, and so on).
+              <View style={styles.control}>
+                <Tap
+                  accessibilityLabel="Mark a stop"
+                  onPress={() => void captureStop()}>
+                  <View style={styles.stopCircle}>
+                    <Icon color={Palette.ink} name="pin" size={22} />
+                  </View>
+                </Tap>
+                <AppText size={11} weight="semibold">
+                  Mark a stop
                 </AppText>
-              </>
+              </View>
+            </View>
+
+            {stopNotice ? (
+              <AppText color={stopNotice.tone} size={10} style={styles.notice}>
+                {stopNotice.text}
+              </AppText>
+            ) : null}
+            {recorder.error ? (
+              <AppText color="red" size={10} style={styles.notice}>
+                {recorder.error}
+              </AppText>
             ) : null}
           </>
         ) : null}
 
-        <PrimaryButton
-          label={saving ? 'Saving…' : 'Save path'}
-          onPress={() => void save()}
-          style={styles.save}
-        />
+        {/* ── Screen 5A: route recorded ────────────────────────────────────── */}
+        {stage === 'finished' ? (
+          <>
+            <View style={styles.finishedHeader}>
+              <IconBadge icon="check" size={44} />
+              <View style={styles.finishedCopy}>
+                <AppText size={18} weight="bold">
+                  Path recorded!
+                </AppText>
+                <AppText color="muted" size={11}>
+                  {formatDistance(finishedDistance || liveMetres)} ·{' '}
+                  {formatDuration(finishedDuration)}
+                  {selectedTravel ? ` · ${selectedTravel.label}` : ''}
+                </AppText>
+              </View>
+            </View>
+
+            {justAdded ? (
+              <View style={styles.stopCard}>
+                <View style={styles.stopCardTop}>
+                  <View style={styles.successDot}>
+                    <Icon color={Palette.surface} name="check" size={14} />
+                  </View>
+                  <View style={styles.stopCardCopy}>
+                    <AppText size={12} weight="bold">
+                      Stop added!
+                    </AppText>
+                    <AppText color="muted" size={10}>
+                      This stop will be included in your route.
+                    </AppText>
+                  </View>
+                  <BareIconButton
+                    accessibilityLabel="Dismiss stop confirmation"
+                    color={Palette.muted}
+                    icon="close"
+                    onPress={() => setJustAdded(null)}
+                    size={16}
+                  />
+                </View>
+                <SecondaryButton
+                  label={viewStops ? 'Hide stops' : 'View stops'}
+                  onPress={() => setViewStops((current) => !current)}
+                  small
+                />
+                {viewStops ? (
+                  <View style={styles.stopList}>
+                    {stops.map((stop) => (
+                      <View key={stop.id} style={styles.stopRow}>
+                        <Icon color={Palette.green} name="pin" size={12} />
+                        <AppText size={10} style={styles.stopRowName}>
+                          {stop.label}
+                        </AppText>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+
+            <PrimaryButton
+              icon="edit"
+              label="Save path"
+              onPress={openSave}
+              style={styles.primaryAction}
+            />
+            <SecondaryButton
+              icon="pin"
+              label={capturing ? 'Measuring…' : 'Mark a stop'}
+              onPress={() => void captureStop()}
+              style={styles.secondaryAction}
+            />
+
+            {stopNotice ? (
+              <AppText color={stopNotice.tone} size={10} style={styles.notice}>
+                {stopNotice.text}
+              </AppText>
+            ) : null}
+            {error ? (
+              <AppText color="red" size={10} style={styles.notice}>
+                {error}
+              </AppText>
+            ) : null}
           </>
-        )}
+        ) : null}
         </ScrollView>
       </View>
-    </KeyboardAvoidingView>
+
+      {/* ── Screen 2: how are you travelling? ─────────────────────────────── */}
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setSliderOpen(null)}
+        transparent
+        visible={sliderOpen === 'travel'}>
+        <View style={styles.overlay}>
+          <Tap
+            accessibilityLabel="Close travel mode sheet"
+            onPress={() => setSliderOpen(null)}
+            style={styles.overlayFill}>
+            <View />
+          </Tap>
+          <View style={[styles.modalSheet, { paddingBottom: insets.bottom + 18 }]}>
+            <SheetHandle />
+            <AppText size={19} weight="bold">
+              How are you travelling?
+            </AppText>
+            <AppText color="muted" size={11} style={styles.modalDescription}>
+              Choose your travel mode to start recording your route.
+            </AppText>
+
+            <TravelDropdown onChange={chooseTravel} value={travelDraft} />
+
+            <PrimaryButton
+              label="Continue"
+              onPress={() => {
+                if (travelDraft == null) {
+                  return;
+                }
+                void startRecording(travelDraft);
+              }}
+              style={[styles.modalPrimary, travelDraft == null && styles.disabled]}
+            />
+            {travelDraft == null ? (
+              <AppText color="muted" size={10} style={styles.centerHint}>
+                Select a travel mode to continue.
+              </AppText>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Settings panel ────────────────────────────────────────────────── */}
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setSliderOpen(null)}
+        transparent
+        visible={sliderOpen === 'settings'}>
+        <View style={styles.overlay}>
+          <Tap
+            accessibilityLabel="Close settings"
+            onPress={() => setSliderOpen(null)}
+            style={styles.overlayFill}>
+            <View />
+          </Tap>
+          <View style={[styles.modalSheet, { paddingBottom: insets.bottom + 18 }]}>
+            <SheetHandle />
+            <AppText size={18} weight="bold" style={styles.settingsTitle}>
+              Route settings
+            </AppText>
+
+            <View style={styles.settingsRow}>
+              <AppText size={12} weight="bold">
+                Travel mode
+              </AppText>
+              <View style={styles.settingsValue}>
+                <AppText color="muted" size={11}>
+                  {selectedTravel?.label ?? 'Not set'}
+                </AppText>
+              </View>
+            </View>
+            {stage !== 'recording' ? (
+              <View style={styles.settingsDropdown}>
+                <TravelDropdown onChange={chooseTravel} value={travelMode} />
+              </View>
+            ) : null}
+
+            <View style={styles.settingsDivider} />
+            <ToggleRow
+              description="Align the recorded line with nearby roads when saving."
+              label="Snap to roads"
+              onChange={setSnapEnabled}
+              value={snapEnabled}
+            />
+            <View style={styles.settingsDivider} />
+            <ToggleRow
+              description="Show the timer and distance while recording."
+              label="Show distance and time"
+              onChange={setShowStats}
+              value={showStats}
+            />
+            {travelMode === 'combi' ? (
+              <>
+                <View style={styles.settingsDivider} />
+                <ToggleRow
+                  description="Stops become boarding points other people can search."
+                  label="Combi route"
+                  onChange={setCombiEnabled}
+                  value={combiEnabled}
+                />
+              </>
+            ) : null}
+
+            <View style={styles.settingsDivider} />
+            <Tap
+              accessibilityLabel="Help"
+              onPress={() => setHelpOpen((current) => !current)}
+              style={styles.settingsRow}>
+              <AppText size={12} weight="bold">
+                Help
+              </AppText>
+              <Icon color={Palette.muted} name={helpOpen ? 'arrow' : 'chevron'} size={16} />
+            </Tap>
+            {helpOpen ? (
+              <AppText color="muted" size={10} style={styles.helpText}>
+                Record traces where you travel using GPS. Draw lets you add points by tapping the
+                map. Mark a stop at each place riders can board or get off, name the path, and save
+                it to the community database so other people can find it.
+              </AppText>
+            ) : null}
+
+            <PrimaryButton
+              label="Done"
+              onPress={() => setSliderOpen(null)}
+              style={styles.modalPrimary}
+            />
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Screen 5B: save path configuration ───────────────────────────── */}
+      <Modal
+        animationType="slide"
+        onRequestClose={() => setSliderOpen(null)}
+        transparent
+        visible={sliderOpen === 'save'}>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.overlay}>
+          <View style={[styles.saveSheet, { maxHeight: Math.round(windowHeight * 0.9) }]}>
+            <View style={styles.saveHandle}>
+              <SheetHandle />
+            </View>
+            <View style={styles.saveHeader}>
+              <BareIconButton
+                accessibilityLabel="Close save panel"
+                color={Palette.ink}
+                icon="close"
+                onPress={() => setSliderOpen(null)}
+              />
+              <AppText size={16} weight="bold" style={styles.saveTitle}>
+                Save path
+              </AppText>
+              <View style={styles.saveHeaderSide} />
+            </View>
+
+            <ScrollView
+              contentContainerStyle={[styles.saveContent, { paddingBottom: insets.bottom + 18 }]}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}>
+              {saved ? (
+                <View style={styles.savedState}>
+                  <IconBadge icon="check" size={52} />
+                  <AppText size={17} weight="bold" style={styles.savedTitle}>
+                    Path saved
+                  </AppText>
+                  <AppText color="muted" size={11} style={styles.savedText}>
+                    {saveError
+                      ? saveError
+                      : `${name.trim()} is on the device and has been sent to the community database.`}
+                  </AppText>
+                  <PrimaryButton
+                    label="Done"
+                    onPress={() => {
+                      setSliderOpen(null);
+                      router.navigate('/saved');
+                    }}
+                    style={styles.saveButton}
+                  />
+                </View>
+              ) : (
+                <>
+                  <AppText size={12} weight="bold">
+                    Name this path
+                  </AppText>
+                  <View style={styles.nameField}>
+                    <TextField
+                      maxLength={MAX_NAME_LENGTH}
+                      onChangeText={setName}
+                      placeholder="Gaborone Mall to Block 8"
+                      value={name}
+                    />
+                  </View>
+                  <AppText color="muted" size={9} style={styles.counter}>
+                    {name.length}/{MAX_NAME_LENGTH}
+                  </AppText>
+
+                  <View style={styles.divider} />
+                  <ToggleRow
+                    description="Align GPS points to nearby roads where a road is available."
+                    label="Snap to roads"
+                    onChange={setSnapEnabled}
+                    value={snapEnabled}
+                  />
+
+                  {travelMode === 'combi' ? (
+                    <View style={styles.combiCard}>
+                      <View style={styles.combiHeader}>
+                        <IconBadge icon="minibus" size={34} />
+                        <View style={styles.combiCopy}>
+                          <AppText size={12} weight="bold">
+                            Mark as combi route
+                          </AppText>
+                          <AppText color="muted" size={10} style={styles.combiHint}>
+                            The named stops become boarding points other people can search, and
+                            the track becomes the road the combi follows.
+                          </AppText>
+                        </View>
+                        <Tap
+                          accessibilityLabel="Mark as combi route"
+                          onPress={() => setCombiEnabled((current) => !current)}>
+                          <View style={[styles.switch, combiEnabled && styles.switchOn]}>
+                            <View style={[styles.switchKnob, combiEnabled && styles.switchKnobOn]} />
+                          </View>
+                        </Tap>
+                      </View>
+
+                      {combiEnabled ? (
+                        <View style={styles.stopNames}>
+                          <AppText color="muted" size={10} weight="semibold">
+                            Boarding points
+                          </AppText>
+                          {labelled.length > 0 ? (
+                            labelled.map((stop, index) => (
+                              <View key={stop.id} style={styles.stopNameRow}>
+                                <AppText color="muted" size={10} style={styles.stopIndex}>
+                                  {index + 1}
+                                </AppText>
+                                <View style={styles.stopNameField}>
+                                  <TextField
+                                    maxLength={60}
+                                    onChangeText={(value) =>
+                                      setStops((current) => {
+                                        const found = current.some((item) => item.id === stop.id);
+                                        // Editing a generated Start/End promotes it to a
+                                        // named stop, so the name survives the save.
+                                        return found
+                                          ? current.map((item) =>
+                                              item.id === stop.id ? { ...item, label: value } : item,
+                                            )
+                                          : [...current, { ...stop, label: value }];
+                                      })
+                                    }
+                                    placeholder={`Stop ${index + 1}`}
+                                    value={stop.label}
+                                  />
+                                </View>
+                              </View>
+                            ))
+                          ) : (
+                            <AppText color="amber" size={10}>
+                              Draw at least two points so the route has a start and an end.
+                            </AppText>
+                          )}
+                          {stops.length === 0 && labelled.length >= 2 ? (
+                            <AppText color="muted" size={10}>
+                              No stops in the middle yet — the start and end are already marked.
+                              Add stops along the way for extra boarding points.
+                            </AppText>
+                          ) : null}
+                        </View>
+                      ) : null}
+                    </View>
+                  ) : null}
+
+                  {saveError ? (
+                    <AppText color="red" size={10} style={styles.saveError}>
+                      {saveError}
+                    </AppText>
+                  ) : null}
+
+                  <PrimaryButton
+                    label={saving ? 'Saving…' : 'Save path'}
+                    onPress={() => void savePath()}
+                    style={styles.saveButton}
+                  />
+                </>
+              )}
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+    </View>
   );
 }
 
@@ -1087,8 +1396,7 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.surface,
     ...Shadows.card,
   },
-  actions: { position: 'absolute', right: 15, gap: 10 },
-  action: {},
+  mapActions: { position: 'absolute', right: 15, gap: 10 },
   sheet: {
     position: 'absolute',
     left: 0,
@@ -1101,123 +1409,219 @@ const styles = StyleSheet.create({
     backgroundColor: Palette.surface,
     ...Shadows.sheet,
   },
-  modeHeading: { marginTop: 14 },
-  hint: { marginTop: 3 },
   sheetContent: { paddingBottom: 2 },
-  recordingStrip: { marginTop: 12, flexDirection: 'row', alignItems: 'center', gap: 8 },
-  recordingDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: Palette.blue },
-  recordingText: { flex: 1 },
-  recordingActions: { marginTop: 10, flexDirection: 'row', alignItems: 'stretch', gap: 10 },
-  addStopButton: { flex: 1.7 },
-  stopRecording: { flex: 1 },
-  statsRow: { marginTop: 10, flexDirection: 'row', alignItems: 'center', gap: 6 },
-  recordActions: { marginTop: 12, flexDirection: 'row', gap: 10 },
-  recordButton: { flex: 1.1 },
-  stopButton: { flex: 1 },
-  notice: { marginTop: 9, lineHeight: 15 },
+  heading: { marginTop: 19 },
+  description: { marginTop: 4, lineHeight: 16 },
+  primaryAction: { marginTop: 17 },
+  secondaryAction: { marginTop: 9 },
+  notice: { marginTop: 9, lineHeight: 14 },
+  disabled: { opacity: 0.55 },
+
+  statsRow: { marginTop: 8, flexDirection: 'row', alignItems: 'center' },
+  stat: { flex: 1, alignItems: 'center', gap: 2 },
+  statDivider: { width: 1, height: 34, backgroundColor: Palette.line },
+  travelChip: {
+    alignSelf: 'center',
+    marginTop: 12,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: Palette.greenSoft,
+  },
+  controls: { marginTop: 20, flexDirection: 'row', justifyContent: 'space-evenly' },
+  control: { alignItems: 'center', gap: 8 },
+  finishButton: {
+    width: 66,
+    height: 66,
+    borderRadius: 33,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Palette.red,
+    ...Shadows.round,
+  },
+  finishSquare: { width: 21, height: 21, borderRadius: 4, backgroundColor: Palette.surface },
+  stopCircle: {
+    width: 66,
+    height: 66,
+    borderWidth: 1,
+    borderColor: '#DCE3DE',
+    borderRadius: 33,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Palette.surface,
+    ...Shadows.round,
+  },
   stopCard: {
     marginTop: 12,
-    paddingVertical: 11,
-    paddingHorizontal: 12,
+    padding: 12,
     borderWidth: 1,
     borderColor: '#CBE7D5',
     borderRadius: Radius.md,
     gap: 10,
     backgroundColor: '#F3FAF5',
   },
-  stopCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 7 },
-  stopCardTitle: { flex: 1 },
-  stopNameField: {
-    height: 42,
-    paddingHorizontal: 11,
-    borderWidth: 1,
-    borderColor: '#DCE2DD',
-    borderRadius: Radius.sm,
+  stopCardTop: { flexDirection: 'row', alignItems: 'center', gap: 9 },
+  successDot: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: Palette.surface,
+    backgroundColor: Palette.green,
   },
-  photoRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  photoPreview: { position: 'relative' },
-  photoThumb: { width: 46, height: 46, borderRadius: Radius.sm, backgroundColor: Palette.soft },
-  photoRemove: {
-    position: 'absolute',
-    top: -6,
-    right: -6,
+  stopCardCopy: { flex: 1, gap: 2 },
+  stopList: { gap: 6 },
+  stopRow: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  stopRowName: { flex: 1 },
+
+  finishedHeader: { marginTop: 6, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  finishedCopy: { flex: 1, gap: 3 },
+
+  overlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(16,24,19,0.35)' },
+  overlayFill: { ...StyleSheet.absoluteFill },
+  modalSheet: {
+    paddingTop: 10,
+    paddingHorizontal: 18,
+    borderTopLeftRadius: Radius.sheet,
+    borderTopRightRadius: Radius.sheet,
+    backgroundColor: Palette.surface,
+    ...Shadows.sheet,
+  },
+  modalDescription: { marginTop: 4, marginBottom: 14, lineHeight: 16 },
+  modalPrimary: { marginTop: 14 },
+  centerHint: { marginTop: 8, textAlign: 'center' },
+
+  dropdown: {
+    minHeight: 48,
+    paddingHorizontal: 13,
+    borderWidth: 1,
+    borderColor: '#D9E0DA',
+    borderRadius: Radius.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#F8FAF8',
+  },
+  dropdownOpen: { borderColor: '#BFE2CB', backgroundColor: Palette.surface },
+  dropdownLabel: { flex: 1 },
+  dropdownList: {
+    marginTop: 8,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: Palette.line,
+    borderRadius: Radius.md,
+    backgroundColor: Palette.surface,
+    ...Shadows.card,
+  },
+  dropdownItem: {
+    minHeight: 44,
+    paddingHorizontal: 10,
+    borderRadius: Radius.sm,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  dropdownItemActive: { backgroundColor: Palette.greenSoft },
+
+  toggleRow: {
+    minHeight: 54,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  toggleCopy: { flex: 1, gap: 2 },
+  toggleHint: { lineHeight: 13 },
+  switch: {
+    width: 44,
+    height: 26,
+    padding: 3,
+    borderRadius: 13,
+    justifyContent: 'center',
+    backgroundColor: '#DDE3DE',
+  },
+  switchOn: { backgroundColor: Palette.green },
+  switchKnob: {
     width: 20,
     height: 20,
     borderRadius: 10,
+    backgroundColor: Palette.surface,
+    ...Shadows.subtle,
+  },
+  switchKnobOn: { alignSelf: 'flex-end' },
+
+  settingsTitle: { marginBottom: 8 },
+  settingsRow: {
+    minHeight: 50,
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: Palette.red,
+    justifyContent: 'space-between',
   },
-  photoHint: { lineHeight: 14 },
-  stopList: {
-    marginTop: 11,
-    paddingVertical: 9,
-    paddingHorizontal: 11,
-    borderWidth: 1,
-    borderColor: Palette.line,
-    borderRadius: Radius.sm,
-    gap: 7,
-    backgroundColor: '#FAFCF9',
+  settingsValue: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  settingsDropdown: { marginBottom: 10 },
+  settingsDivider: { height: 1, backgroundColor: Palette.line },
+  helpText: { marginBottom: 8, lineHeight: 15 },
+
+  saveSheet: {
+    borderTopLeftRadius: Radius.sheet,
+    borderTopRightRadius: Radius.sheet,
+    backgroundColor: Palette.surface,
+    ...Shadows.sheet,
   },
-  stopRow: { flexDirection: 'row', alignItems: 'center', gap: 7 },
-  stopRowName: { flex: 1 },
-  stopRowThumb: { width: 22, height: 22, borderRadius: 6, backgroundColor: Palette.soft },
-  profileRow: { marginTop: 14, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  segmented: { flex: 1 },
-  snapButton: { minWidth: 118 },
-  summaryRow: { marginTop: 12, flexDirection: 'row', alignItems: 'center', gap: 6 },
+  saveHandle: { alignItems: 'center', paddingTop: 8 },
+  saveHeader: {
+    paddingHorizontal: 14,
+    paddingTop: 2,
+    paddingBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: Palette.line,
+  },
+  saveTitle: { flex: 1, textAlign: 'center' },
+  saveHeaderSide: { width: 36 },
+  saveContent: { paddingHorizontal: 18, paddingTop: 18 },
   nameField: {
-    marginTop: 10,
-    height: 45,
+    marginTop: 8,
+    height: 48,
     paddingHorizontal: 12,
     borderWidth: 1,
     borderColor: '#DCE2DD',
     borderRadius: Radius.sm,
     justifyContent: 'center',
   },
-  combiToggle: {
-    marginTop: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 11,
+  counter: { marginTop: 5, textAlign: 'right' },
+  divider: { height: 1, marginVertical: 8, backgroundColor: Palette.line },
+  combiCard: {
+    marginTop: 6,
+    padding: 12,
     borderWidth: 1,
     borderColor: Palette.line,
-    borderRadius: Radius.sm,
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 9,
+    borderRadius: Radius.md,
     backgroundColor: '#FAFCF9',
   },
-  combiToggleCopy: { flex: 1, gap: 2 },
-  combiToggleHint: { lineHeight: 13 },
-  combiHint: { marginTop: 8, lineHeight: 14 },
-  checkbox: {
-    width: 19,
-    height: 19,
-    marginTop: 1,
-    borderWidth: 1,
-    borderColor: '#C3CEC6',
-    borderRadius: 5,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: Palette.surface,
-  },
-  checkboxOn: { borderColor: Palette.green, backgroundColor: Palette.green },
-  fareRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  fareLabel: { flex: 1 },
-  fareField: {
-    width: 96,
+  combiHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  combiCopy: { flex: 1, gap: 3 },
+  combiHint: { lineHeight: 13 },
+  stopNames: { marginTop: 12, gap: 8 },
+  stopNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  stopIndex: { width: 14, textAlign: 'center' },
+  stopNameField: {
+    flex: 1,
     height: 38,
     paddingHorizontal: 10,
     borderWidth: 1,
     borderColor: '#DCE2DD',
     borderRadius: Radius.sm,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
+    justifyContent: 'center',
     backgroundColor: Palette.surface,
   },
-  error: { marginTop: 8 },
-  save: { marginTop: 14 },
+  saveError: { marginTop: 12, lineHeight: 14 },
+  saveButton: { marginTop: 18 },
+  savedState: { alignItems: 'center', gap: 8, paddingVertical: 18 },
+  savedTitle: { marginTop: 4 },
+  savedText: { textAlign: 'center', lineHeight: 16, maxWidth: 280 },
 });

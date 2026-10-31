@@ -79,9 +79,9 @@ export type PathRecorder = {
    * pressed the button — the watch can take several seconds to produce its first
    * reading, and the trip must still start at the rank, not halfway down the road.
    */
-  start: (seed?: Coords | null) => Promise<void>;
+  start: (seed?: Coords | null) => Promise<boolean>;
   /** Resume the watch on the track already recorded, without clearing it. */
-  resume: () => Promise<void>;
+  resume: () => Promise<boolean>;
   stop: () => void;
   clear: () => void;
   /** Drop the most recent track point (undo for a stray reading). */
@@ -164,22 +164,22 @@ export function usePathRecorder(): PathRecorder {
    * seeded with the position the contributor was standing at, so the line starts
    * at the rank even if the first watch reading is slow to arrive.
    */
-  const beginWatch = useCallback(async (seed: Coords | null, keep: boolean) => {
+  const beginWatch = useCallback(async (seed: Coords | null, keep: boolean): Promise<boolean> => {
     if (subscription.current) {
-      return;
+      return true;
     }
     setError(null);
     try {
       const servicesEnabled = await Location.hasServicesEnabledAsync();
       if (!servicesEnabled) {
         setError('Location services are turned off on this device.');
-        return;
+        return false;
       }
 
       const permission = await Location.requestForegroundPermissionsAsync();
       if (permission.status !== 'granted') {
         setError('Location permission is needed to record a path.');
-        return;
+        return false;
       }
 
       let seeded: FixSample | null = null;
@@ -223,8 +223,10 @@ export function usePathRecorder(): PathRecorder {
           }
         });
       }
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not start recording.');
+      return false;
     }
   }, [addPoint]);
 

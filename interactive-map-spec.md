@@ -286,44 +286,11 @@ Unify "add a place" and "draw a path" into one coherent flow so the form uses th
 
 ---
 
-## 10. Community backend — Cloudflare (locked: stay on Cloudflare)
+## 10. Community backend — Node.js + Express + PostGIS
 
-Decision inputs: **stay on Cloudflare**, **community-shared data**, **lightweight accounts**,
-**review queue moderation**, **photo uploads**, **Botswana now / global later**, and **free/cheap**.
-
-### 10.1 Recommended stack
-
-| Concern | Recommendation | Notes |
-| --- | --- | --- |
-| API | **Cloudflare Workers** | Cloudflare publishes an official **Expo mobile app** framework guide. |
-| Database | **D1 (SQLite)** | See §10.2 for the geospatial caveat and the recommended workaround. |
-| Object storage | **R2** | Place/path photos (§12). |
-| Auth | **Clerk** | First-class Workers support; email + social; managed sessions; fits "lightweight accounts". Alternatives: Better Auth or Expo's own auth patterns. |
-| Admin dashboard | **Cloudflare Pages** (or Workers) web console | Independent of the mobile app (§13). |
-| Edge caching | **Workers cache / Cache API** | For read-heavy public place/path lists. |
-
-### 10.2 Geospatial storage — recommendation (reporter asked us to decide)
-
-**D1 has no native geospatial support** (there is an open Cloudflare feature request for R-tree /
-geo queries; D1 is SQLite without PostGIS). Recommendation:
-
-- **Primary (now):** store `latitude`, `longitude`, a computed bounding-box pair
-  (`min_lat/max_lat/min_lng/max_lng`), **and** a **geohash** column (e.g. geohash-7). Index the
-  geohash. Query "places near X" as a **geohash-prefix + bounding-box** scan in a Worker, refined with
-  a **Haversine** distance (the app already has `distanceMetres` in `src/lib/geo.ts`). This is
-  simple, cheap, and plenty for a Botswana-scale dataset.
-- **Escape hatch (later/global):** if real spatial queries or scale demand it, add a free
-  **Postgres + PostGIS sibling** (e.g. Neon free tier) for the places table while keeping
-  Workers/R2/D1 for everything else. Do **not** block the first release on this.
-
-### 10.3 Why not a managed BaaS instead
-
-Supabase/Firebase would reduce setup (Postgres+PostGIS / Firestore geo), but the reporter explicitly
-prefers Cloudflare and wants cost minimized. The Cloudflare stack above is achievable on free tiers
-and keeps everything in one account. **This is the recommendation, subject to the reporter's final
-sign-off.**
-
----
+The community API lives in `../backend/` (Express over PostgreSQL/PostGIS, photos in
+S3-compatible object storage). The app talks to it through `src/lib/api.ts` and
+`src/lib/chat.ts` only. One backend service owns the database, storage and moderation.
 
 ## 11. Region scope (locked: Botswana now, global later)
 
@@ -344,11 +311,11 @@ sign-off.**
 
 ## 13. Data model (initial)
 
-Stored in D1 (SQLite). Types mirror the existing app types in `src/data/myroute.ts` and
+Stored in PostgreSQL + PostGIS. Types mirror the existing app types in `src/data/myroute.ts` and
 `src/components/myroute/map-types.ts`.
 
 ```
-users(id, display_name, email, created_at)                     -- via Clerk
+users(id, display_name, email, created_at)
 
 places(
   id, name, category, description,
@@ -387,10 +354,10 @@ reviews(id, owner_type, owner_id, reviewer_id, decision, note, created_at)  -- m
 
 ## 15. Auth & moderation
 
-- **Auth:** lightweight accounts via **Clerk** (email + a social provider). Required to contribute.
+- **Auth:** lightweight accounts (email + a social provider). Required to contribute.
 - **Moderation:** a **review queue** — contributions land in `pending`. A moderator approves/rejects
   before anything is publicly visible. Every decision is logged in `reviews`.
-- **Surface:** a **separate web dashboard** (Cloudflare Pages) that lists pending places/paths/photos
+- **Surface:** a **separate web dashboard** served by the Express backend that lists pending places/paths/photos
   with map previews, approve/reject actions, and reporter/contributor info. Restricted to admins.
 
 ---
@@ -423,7 +390,7 @@ confirm the native module is present; ship the narrow fix and confirm on an EAS 
 
 **M5 — Draw/save custom paths** (§8) and wire the Add-place form to the real map.
 
-**M6 — Community backend** (§10–§15): Workers + D1 + Clerk + R2, review queue, web dashboard, photos.
+**M6 — Community backend** (§10–§15): Express + PostGIS + object storage, review queue, web dashboard, photos.
 
 **M7 — Provider decision & self-host** (§5 Phase B / §7) if whole-region offline is required.
 
@@ -459,7 +426,7 @@ confirm the native module is present; ship the narrow fix and confirm on an EAS 
 - **[ ]** Final tile/style provider (§7) — OpenFreeMap vs self-host vs keyed, after the investigation.
 - **[ ]** Whether whole-Botswana offline is required (drives §5 Phase B and §7 self-hosting).
 - **[ ]** Which free geocoder to adopt (§6); preference is LocationIQ/Geoapify, pending comparison.
-- **[ ]** Final backend sign-off on the Cloudflare recommendation (§10) and Clerk for auth.
+- **[ ]** Final backend sign-off on the auth provider.
 - **[ ]** Custom-style hosting: if the style is customised (Maputnik), the style JSON must be
   self-hosted per OpenFreeMap's guidance.
 - **[ ]** Correct the outdated offline-download claim in `src/constants/map.ts`.

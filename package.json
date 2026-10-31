@@ -57,7 +57,8 @@
     "web:export": "expo export --platform web",
     "map:worker": "node ./scripts/sync-map-worker.cjs",
     "lint": "expo lint",
-    "test:photo": "node --test tests/photo-limits.test.mjs"
+    "test:photo": "node --test tests/photo-limits.test.mjs",
+    "test:paths": "node --test tests/path-labels.test.mjs"
   },
   "private": true
 }

@@ -1,5 +1,5 @@
 import { distanceMetres, type LatLng } from './geo';
-import type { PathWaypoint, SavedPath } from './paths';
+import { labelledEndpoints, type PathWaypoint, type SavedPath } from './paths';
 
 /**
  * Combi journeys.
@@ -48,6 +48,10 @@ export type CombiRoute = {
   rank: string;
   /** Stops in the order the combi reaches them. */
   stops: CombiStop[];
+  /** The road line the contributor recorded, when there is one ([lng, lat]). */
+  geometry?: [number, number][];
+  /** Distance of the recorded line, in metres, when known. */
+  distanceMetres?: number;
 };
 
 /** One combi you stay on, from the stop you board to the stop you get off. */
@@ -383,6 +387,7 @@ export type ApiCombiRoute = {
   clientId?: string | null;
   name: string;
   rank?: string;
+  status?: string;
   origin?: string;
   destination?: string;
   geometry?: { type: 'LineString'; coordinates: [number, number][] } | null;
@@ -408,25 +413,54 @@ export function combiRoutesFromApi(records: ApiCombiRoute[]): CombiRoute[] {
     if (name.length === 0) {
       continue;
     }
-    const stops = [...(record.stops ?? [])]
+    const capturedAt =
+      typeof record.createdAt === 'string'
+        ? Date.parse(record.createdAt)
+        : typeof record.createdAt === 'number'
+          ? record.createdAt
+          : Date.now();
+    const waypoints: PathWaypoint[] = [...(record.stops ?? [])]
       .sort((a, b) => Number(a.seq) - Number(b.seq))
-      .map((stop) =>
-        toCombiStop({
-          id: `stop-${stop.seq}`,
-          label: stop.label,
-          latitude: stop.latitude,
-          longitude: stop.longitude,
-          accuracy: null,
-          capturedAt: 0,
-          fareFromPrevious: stop.fareFromPrevious,
-        }),
-      )
+      .map((stop) => ({
+        id: `stop-${stop.seq}`,
+        label: typeof stop.label === 'string' ? stop.label : '',
+        latitude: stop.latitude,
+        longitude: stop.longitude,
+        accuracy: null,
+        capturedAt: Number.isFinite(capturedAt) ? capturedAt : Date.now(),
+        fareFromPrevious: stop.fareFromPrevious ?? null,
+      }));
+    // Community rows are untrusted: an unnamed or mislocated stop never reaches
+    // the planner, where it would put NaN into every distance.
+    const usable = waypoints.filter(
+      (stop) =>
+        stop.label.trim().length > 0 &&
+        Number.isFinite(stop.latitude) &&
+        Number.isFinite(stop.longitude),
+    );
+
+    const line = record.geometry?.coordinates;
+    // A route always carries a start and an end: with a recorded line its two
+    // ends are labelled, so a route uploaded without stops still plans.
+    const forEndpoints: [number, number][] =
+      Array.isArray(line) && line.length >= 2
+        ? line
+        : usable.map((stop) => [stop.longitude, stop.latitude] as [number, number]);
+    const stops = labelledEndpoints(forEndpoints, usable)
+      .map(toCombiStop)
       .filter((stop): stop is CombiStop => stop != null);
 
     if (stops.length < 2) {
       continue;
     }
-    routes.push({ id: record.id, name, rank: (record.rank ?? '').trim(), stops });
+    routes.push({
+      id: record.id,
+      name,
+      rank: (record.rank ?? '').trim(),
+      stops,
+      ...(Array.isArray(line) && line.length >= 2 ? { geometry: line } : {}),
+      ...(record.distanceMetres != null ? { distanceMetres: Number(record.distanceMetres) } : {}),
+    });
   }
   return routes;
 }
@@ -482,7 +516,7 @@ export function savedPathsFromCombiRoutes(records: ApiCombiRoute[]): SavedPath[]
       distanceMetres: Number(record?.distanceMetres ?? 0) || 0,
       durationSeconds: 0,
       createdAt,
-      status: 'approved',
+      status: record?.status === 'pending' ? 'pending' : 'approved',
     };
   });
 }
@@ -495,20 +529,30 @@ export function savedPathsFromCombiRoutes(records: ApiCombiRoute[]): SavedPath[]
 export function combiRoutesFromPaths(paths: SavedPath[]): CombiRoute[] {
   const routes: CombiRoute[] = [];
   for (const path of paths) {
-    if (path.kind !== 'combi' || !Array.isArray(path.waypoints)) {
+    if (path.kind !== 'combi') {
       continue;
     }
     const name = (path.combiName ?? '').trim() || path.name?.trim() || '';
     if (name.length === 0) {
       continue;
     }
-    const stops = path.waypoints
+    const line = path.coordinates.length >= 2 ? path.coordinates : path.vertices;
+    // Start and End are supplied by the line itself when the contributor never
+    // marked anything, so a route saved without stops is still a route.
+    const stops = labelledEndpoints(line, path.waypoints ?? [])
       .map(toCombiStop)
       .filter((stop): stop is CombiStop => stop != null);
     if (stops.length < 2) {
       continue;
     }
-    routes.push({ id: path.id, name, rank: (path.rank ?? '').trim(), stops });
+    routes.push({
+      id: path.id,
+      name,
+      rank: (path.rank ?? '').trim(),
+      stops,
+      ...(line.length >= 2 ? { geometry: line } : {}),
+      ...(path.distanceMetres > 0 ? { distanceMetres: path.distanceMetres } : {}),
+    });
   }
   return routes;
 }

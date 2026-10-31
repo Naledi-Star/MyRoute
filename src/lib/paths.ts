@@ -3,6 +3,12 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getRouteThrough, type TravelProfile } from './routing';
 
 /**
+ * Start / End labelling lives in `geo.ts`, where it stays pure enough to test
+ * on its own; it is re-exported here because paths are its callers' vocabulary.
+ */
+export { labelledEndpoints } from './geo';
+
+/**
  * A named stop captured while recording a path.
  *
  * Stored next to the geometry rather than inside it: `vertices` stays a plain
@@ -123,6 +129,26 @@ export async function addPath(
   // Upsert: re-saving a synced record keeps its id, so drop the old copy first
   // instead of ending up with the same path twice.
   const next = [path, ...paths.filter((existing) => existing.id !== path.id)];
+  await persist(next);
+  return next;
+}
+
+/**
+ * Merge records fetched from the server into the on-device copy.
+ *
+ * The server is the source of truth for who contributed what, but the device
+ * keeps its own copy so a path can be drawn, edited and previewed without a
+ * round trip. Server ids replace local ids where they are the same record, and
+ * an already-synced local copy keeps its id so nothing is listed twice.
+ */
+export async function mergePaths(incoming: SavedPath[]): Promise<SavedPath[]> {
+  const paths = await loadPaths();
+  const byId = new Map(paths.map((path) => [path.id, path]));
+  for (const path of incoming) {
+    const existing = byId.get(path.id);
+    byId.set(path.id, existing ? { ...existing, ...path } : path);
+  }
+  const next = [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
   await persist(next);
   return next;
 }

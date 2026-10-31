@@ -35,6 +35,13 @@ const TONE_HEX: Record<NonNullable<MapMarker['tone']>, string> = {
 };
 
 /**
+ * Colour of a path drawn as map data. Paths are the map — a road somebody drove
+ * that the provider does not know yet — so they are drawn in the app's green,
+ * distinct from the blue preview of a route being inspected.
+ */
+const MAP_DATA_PATH_COLOR = '#0B8A57';
+
+/**
  * Build the DOM element for a single marker. Kept simple: a teardrop pin drawn
  * with CSS, with a small label underneath.
  */
@@ -105,12 +112,16 @@ export function InteractiveMap({
   bottomInset = 0,
   markers = [],
   route,
+  routes,
   onMarkerPress,
   droppedPin,
   onMapPress,
   userLocation = null,
   followUser = false,
   recenterKey = 0,
+  zoomInKey = 0,
+  zoomOutKey = 0,
+  fitRoute = false,
   style,
 }: InteractiveMapProps) {
   const container = useRef<View>(null);
@@ -123,6 +134,8 @@ export function InteractiveMap({
   const framedFocus = useRef<InteractiveMapProps['focus']>('gaborone');
   const framedKey = useRef(0);
   const lastFollow = useRef<[number, number] | null>(null);
+  const zoomKeys = useRef({ in: zoomInKey, out: zoomOutKey });
+  const framedRoute = useRef<string | null>(null);
   const activeMarkers = useRef<MapLibreMarker[]>([]);
   const maplibreModule = useRef<typeof import('maplibre-gl') | null>(null);
 
@@ -306,6 +319,114 @@ export function InteractiveMap({
     });
   }, [followUser, map, userLocation]);
 
+  // Map controls: one step in or out, from wherever the camera already is.
+  // The key is compared against the last one acted on, so mounting the map does
+  // not zoom by itself.
+  useEffect(() => {
+    if (zoomInKey === zoomKeys.current.in) {
+      return;
+    }
+    zoomKeys.current.in = zoomInKey;
+    if (map != null) {
+      map.zoomTo(map.getZoom() + 1, { duration: 350 });
+    }
+  }, [map, zoomInKey]);
+
+  useEffect(() => {
+    if (zoomOutKey === zoomKeys.current.out) {
+      return;
+    }
+    zoomKeys.current.out = zoomOutKey;
+    if (map != null) {
+      map.zoomTo(Math.max(1, map.getZoom() - 1), { duration: 350 });
+    }
+  }, [map, zoomOutKey]);
+
+  // Show the whole recorded line once the trip is finished.
+  const routeBounds =
+    fitRoute && route && route.coordinates.length >= 2
+      ? route.coordinates.reduce<[number, number, number, number]>(
+          ([west, south, east, north], [lng, lat]) => [
+            Math.min(west, lng),
+            Math.min(south, lat),
+            Math.max(east, lng),
+            Math.max(north, lat),
+          ],
+          [Infinity, Infinity, -Infinity, -Infinity],
+        )
+      : null;
+
+  useEffect(() => {
+    if (map == null || routeBounds == null) {
+      return;
+    }
+    const key = routeBounds.map((value) => value.toFixed(5)).join(',');
+    if (framedRoute.current === key) {
+      return;
+    }
+    framedRoute.current = key;
+    map.fitBounds(
+      [
+        [routeBounds[0], routeBounds[1]],
+        [routeBounds[2], routeBounds[3]],
+      ],
+      {
+        padding: { top: 120, bottom: bottomInset + 160, left: 40, right: 40 },
+        duration: 700,
+      },
+    );
+  }, [bottomInset, map, routeBounds]);
+
+  // ── Map data: the community's paths ────────────────────────────────────
+  useEffect(() => {
+    if (map == null || routes == null) {
+      return;
+    }
+    const sourceId = 'myroute-routes';
+    const layerId = 'myroute-routes-lines';
+    const data = {
+      type: 'FeatureCollection' as const,
+      features: routes
+        .filter((entry) => entry.coordinates.length >= 2)
+        .map((entry) => ({
+          type: 'Feature' as const,
+          properties: { color: entry.color ?? MAP_DATA_PATH_COLOR },
+          geometry: { type: 'LineString' as const, coordinates: entry.coordinates },
+        })),
+    };
+
+    const apply = () => {
+      const existing = map.getSource(sourceId) as
+        | { setData?: (value: unknown) => void }
+        | undefined;
+      if (existing?.setData) {
+        existing.setData(data);
+        return;
+      }
+      if (map.getSource(sourceId)) {
+        return;
+      }
+      map.addSource(sourceId, { type: 'geojson', data });
+      map.addLayer({
+        id: layerId,
+        type: 'line',
+        source: sourceId,
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': ['get', 'color'],
+          'line-width': 3,
+          'line-opacity': 0.85,
+        },
+      });
+    };
+
+    if (map.isStyleLoaded()) {
+      apply();
+    } else {
+      map.once('style.load', apply);
+    }
+  }, [map, routes]);
+
   // ── Markers ────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (map == null || maplibreModule.current == null) {
@@ -363,6 +484,9 @@ export function InteractiveMap({
           properties: {},
           geometry: { type: 'LineString', coordinates: route.coordinates },
         });
+        map.setPaintProperty(layerId, 'line-color', route.color ?? '#2779E8');
+        map.setPaintProperty(layerId, 'line-width', route.dashed ? 4 : 5);
+        map.setPaintProperty(layerId, 'line-dasharray', route.dashed ? [1.2, 1.6] : [1, 0]);
       } else {
         map.addSource(sourceId, {
           type: 'geojson',
@@ -379,8 +503,9 @@ export function InteractiveMap({
           layout: { 'line-join': 'round', 'line-cap': 'round' },
           paint: {
             'line-color': route.color ?? '#2779E8',
-            'line-width': 5,
+            'line-width': route.dashed ? 4 : 5,
             'line-opacity': 0.9,
+            ...(route.dashed ? { 'line-dasharray': [1.2, 1.6] } : {}),
           },
         });
       }
