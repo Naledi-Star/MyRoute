@@ -130,7 +130,8 @@ export default function ThreadScreen() {
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={insets.top}
       style={styles.screen}>
       <View style={[styles.header, { paddingTop: insets.top }]}>
         <TopBar

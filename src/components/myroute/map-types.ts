@@ -22,6 +22,22 @@ export type MapMarker = {
   kind?: 'place' | 'request' | 'destination';
 };
 
+/**
+ * Colour of a recorded path drawn as map data.
+ *
+ * A path is part of the map — a road somebody recorded that the tile provider
+ * does not know yet — so it is drawn in a neutral cartographic grey like the
+ * provider's own streets, not in a highlight colour that shouts over them.
+ */
+export const PATH_LINE_COLOR = '#8C99A3';
+
+/**
+ * A combi route is an overlay on the map rather than a road, so it keeps the
+ * app's blue and a dashed stroke: a route lying inside a recorded path is still
+ * visibly a different thing.
+ */
+export const COMBI_LINE_COLOR = '#2779E8';
+
 /** A route to draw on the map, already in GeoJSON coordinates. */
 export type MapRoute = {
   coordinates: [number, number][];

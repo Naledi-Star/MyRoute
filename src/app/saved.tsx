@@ -250,7 +250,12 @@ export default function SavedScreen() {
                         color={Palette.muted}
                         icon="chevron"
                         onPress={() =>
-                          router.push({ pathname: '/draw-path', params: { id: path.id } })
+                          router.push({
+                            pathname: path.kind === 'combi' ? '/record-combi' : '/draw-path',
+                            // Each kind is edited in its own flow: a combi route
+                            // is never reopened in the path recorder.
+                            params: { id: path.id },
+                          })
                         }
                       />
                       <BareIconButton
@@ -335,7 +340,7 @@ export default function SavedScreen() {
                 style={styles.action}
               />
               <PrimaryButton
-                label="Draw a path"
+                label="Record a path"
                 onPress={() => router.push('/draw-path')}
                 small
                 style={styles.action}

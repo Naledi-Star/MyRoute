@@ -529,7 +529,10 @@ export function savedPathsFromCombiRoutes(records: ApiCombiRoute[]): SavedPath[]
 export function combiRoutesFromPaths(paths: SavedPath[]): CombiRoute[] {
   const routes: CombiRoute[] = [];
   for (const path of paths) {
-    if (path.kind !== 'combi') {
+    // A record that carries a combi name is a ride even if an older build filed
+    // it among the paths; the name is what the contributor typed for it.
+    const isCombi = path.kind === 'combi' || (path.combiName ?? '').trim().length > 0;
+    if (!isCombi) {
       continue;
     }
     const name = (path.combiName ?? '').trim() || path.name?.trim() || '';

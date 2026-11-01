@@ -6,7 +6,13 @@ import { Platform, StyleSheet, TurboModuleRegistry, View } from 'react-native';
 import { MapAttribution } from './map-attribution';
 import { hasMapLibreNativeCode, type TurboModuleLookup } from './map-native-code';
 import { MapFailure, MapLoading } from './map-status';
-import type { InteractiveMapProps, MapMarker } from './map-types';
+import {
+  COMBI_LINE_COLOR,
+  PATH_LINE_COLOR,
+  type InteractiveMapProps,
+  type MapMarker,
+  type MapRoute,
+} from './map-types';
 
 import {
   BOTSWANA_BOUNDS,
@@ -33,13 +39,6 @@ const TONE_HEX: Record<NonNullable<MapMarker['tone']>, string> = {
   blue: '#2779E8',
   amber: '#E69D3B',
 };
-
-/**
- * Colour of a path drawn as map data. Paths are the map — a road somebody drove
- * that the provider does not know yet — so they are drawn in the app's green,
- * distinct from the blue preview of a route being inspected.
- */
-const MAP_DATA_PATH_COLOR = '#0B8A57';
 
 function isMapLibreNativeCodePresent(): boolean {
   return hasMapLibreNativeCode(TurboModuleRegistry as TurboModuleLookup);
@@ -305,23 +304,29 @@ export function InteractiveMap({
       }
     : null;
 
-  // Map data: every path the community has recorded, drawn together as part of
-  // the map rather than as somebody's preview.
-  const routesShape = routes?.length
-    ? {
-        type: 'FeatureCollection' as const,
-        features: routes
-          .filter((entry) => entry.coordinates.length >= 2)
-          .map((entry) => ({
-            type: 'Feature' as const,
-            properties: { color: entry.color ?? MAP_DATA_PATH_COLOR },
-            geometry: {
-              type: 'LineString' as const,
-              coordinates: entry.coordinates,
-            },
-          })),
-      }
-    : null;
+  // Map data: every path the community has recorded, drawn as part of the map
+  // rather than as somebody's preview. Solid lines are recorded paths — a
+  // neutral cartographic stroke, the way the provider draws its own roads — and
+  // dashed lines are combi routes, which are an overlay rather than a road.
+  const lineCollection = (list: MapRoute[] | undefined, dashed: boolean) => {
+    const features = (list ?? [])
+      .filter((entry) => entry.coordinates.length >= 2 && entry.dashed === dashed)
+      .map((entry) => ({
+        type: 'Feature' as const,
+        properties: {
+          color: entry.color ?? (dashed ? COMBI_LINE_COLOR : PATH_LINE_COLOR),
+        },
+        geometry: {
+          type: 'LineString' as const,
+          coordinates: entry.coordinates,
+        },
+      }));
+    return features.length > 0
+      ? { type: 'FeatureCollection' as const, features }
+      : null;
+  };
+  const solidRoutesShape = lineCollection(routes, false);
+  const dashedRoutesShape = lineCollection(routes, true);
 
   return (
     <View style={[styles.container, style]}>
@@ -371,15 +376,31 @@ export function InteractiveMap({
           ref={camera}
         />
 
-        {routesShape && routesShape.features.length > 0 ? (
-          <GeoJSONSource data={routesShape} id="myroute-routes">
+        {solidRoutesShape ? (
+          <GeoJSONSource data={solidRoutesShape} id="myroute-routes">
             <Layer
               id="myroute-routes-lines"
               layout={{ 'line-cap': 'round', 'line-join': 'round' }}
               paint={{
                 'line-color': ['get', 'color'],
                 'line-width': 3,
+                'line-opacity': 0.9,
+              }}
+              type="line"
+            />
+          </GeoJSONSource>
+        ) : null}
+
+        {dashedRoutesShape ? (
+          <GeoJSONSource data={dashedRoutesShape} id="myroute-combi-routes">
+            <Layer
+              id="myroute-combi-routes-lines"
+              layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              paint={{
+                'line-color': ['get', 'color'],
+                'line-width': 3,
                 'line-opacity': 0.85,
+                'line-dasharray': [1.4, 1.6],
               }}
               type="line"
             />

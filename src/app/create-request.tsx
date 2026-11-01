@@ -1,5 +1,5 @@
 import { PlaceFormScreen } from '@/components/myroute/place-form';
 
 export default function CreateRequestScreen() {
-  return <PlaceFormScreen request />;
+  return <PlaceFormScreen mode="request" />;
 }

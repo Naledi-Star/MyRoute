@@ -7,7 +7,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/myroute/icon';
 import { InteractiveMap } from '@/components/myroute/interactive-map';
-import type { MapFocus, MapMarker, MapRoute } from '@/components/myroute/map-types';
+import {
+  COMBI_LINE_COLOR,
+  PATH_LINE_COLOR,
+  type MapFocus,
+  type MapMarker,
+  type MapRoute,
+} from '@/components/myroute/map-types';
 import { AppText } from '@/components/myroute/text';
 import {
   RoundButton,
@@ -127,16 +133,19 @@ export default function ExploreScreen() {
     [communityPlaces],
   );
 
-  // A combi route without a verified road line is a list of stops, not a road,
-  // so it is never drawn as map data — it lives on the Combies tab.
+  // Recorded lines are map data, so they are drawn the way the provider draws
+  // its own roads (a neutral cartographic stroke) rather than as a green
+  // highlight. A combi route is an overlay on top of that map, so it keeps the
+  // blue dashed line — the two are never mistakable for each other.
   const pathLines = useMemo<MapRoute[]>(
     () =>
       communityPaths
-        .filter(
-          (path) =>
-            path.coordinates.length >= 2 && (path.kind !== 'combi' || path.snapped),
-        )
-        .map((path) => ({ coordinates: path.coordinates })),
+        .filter((path) => path.coordinates.length >= 2)
+        .map((path) =>
+          path.kind === 'combi'
+            ? { coordinates: path.coordinates, color: COMBI_LINE_COLOR, dashed: true }
+            : { coordinates: path.coordinates, color: PATH_LINE_COLOR },
+        ),
     [communityPaths],
   );
 
@@ -182,11 +191,10 @@ export default function ExploreScreen() {
           </View>
           <View>
             <RoundButton
-              accessibilityLabel="Community notifications"
+              accessibilityLabel="Notifications"
               icon="bell"
-              onPress={() => router.navigate('/requests')}
+              onPress={() => router.push('/notifications')}
             />
-            <View style={styles.notificationDot} />
           </View>
         </View>
 

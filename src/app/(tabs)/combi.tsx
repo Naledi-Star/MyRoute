@@ -394,7 +394,7 @@ export default function CombiScreen() {
 
           <PrimaryButton
             label="Record the combi route you use"
-            onPress={() => router.push('/draw-path')}
+            onPress={() => router.push('/record-combi')}
             style={styles.recordButton}
           />
         </View>
@@ -414,7 +414,7 @@ export default function CombiScreen() {
             <RoundButton
               accessibilityLabel="Record a combi route"
               icon="plus"
-              onPress={() => router.push('/draw-path')}
+              onPress={() => router.push('/record-combi')}
             />
           }
           eyebrow="Community network"
@@ -474,7 +474,7 @@ export default function CombiScreen() {
             </AppText>
             <PrimaryButton
               label="Record a combi route"
-              onPress={() => router.push('/draw-path')}
+              onPress={() => router.push('/record-combi')}
               small
               style={styles.emptyButton}
             />
@@ -493,7 +493,7 @@ export default function CombiScreen() {
             </AppText>
             <PrimaryButton
               label="Record a combi route"
-              onPress={() => router.push('/draw-path')}
+              onPress={() => router.push('/record-combi')}
               small
               style={styles.emptyButton}
             />
@@ -587,7 +587,7 @@ export default function CombiScreen() {
         {routes != null && routes.length > 0 ? (
           <PrimaryButton
             label="Record the combi route you use"
-            onPress={() => router.push('/draw-path')}
+            onPress={() => router.push('/record-combi')}
             style={styles.recordButton}
           />
         ) : null}
